@@ -1,4 +1,5 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin as V1Plugin } from "@opencode-ai/plugin"
+import type { Plugin as V2 } from "@opencode/plugin"
 
 // Hallucinated file-proxy artifact URLs. Small quantized Qwen models
 // regurgitate signed Aliyun OSS "file proxy" links from their pretraining
@@ -35,11 +36,17 @@ import type { Plugin } from "@opencode-ai/plugin"
 // blocklist. Without that, an agent with this plugin installed could not
 // even edit or grep this file. A test enforces the property.
 //
-// Loader-contract note: opencode treats EVERY module export as a plugin
-// factory (getLegacyPlugins in packages/opencode/src/plugin/index.ts throws
-// "Plugin export is not a function" for anything else, and the whole plugin
-// then loads as nothing — enforcement silently off, error only in the log).
-// So internals are attached to the single default export, never re-exported.
+// Dual-entrypoint note (V1 + V2): the default export is ONE object carrying
+// both runtimes' entrypoints. V1 (>= 1.18.29 object entrypoints) calls
+// `server()` and returns hooks by string key; V2 reads `id` + `setup(ctx)`
+// and registers hooks through the tool domain. The two APIs stay separate —
+// the shared logic lives in verdict()/findBlocked(), not in a translated
+// shim. Remove `server` after the V1 support window ends.
+// Loader-contract note: V1's loader iterates EVERY module export and throws
+// "Plugin export is not a function" for values that are neither functions
+// nor objects with a callable `server` (the whole plugin then loads as
+// nothing — enforcement silently off, error only in the log). So internals
+// are attached to the single default export, never re-exported.
 // A test enforces that contract too.
 
 const BLOCKED: { pattern: RegExp; why: string }[] = [
@@ -79,24 +86,44 @@ const TERSE_GUIDANCE =
 // Server-process-scale cap; clearing wholesale is fine at this size.
 const WARNED_CAP = 500
 
-const blockProxy = Object.assign(
-  (async () => {
+// Shared enforcement for both runtimes: returns the error message for a
+// blocked call shape (recording the session as warned), or null to allow it.
+function verdict(args: unknown, warned: Map<string, boolean>, session: string): string | null {
+  const hit = findBlocked(args)
+  if (!hit) return null
+  const first = !warned.has(session)
+  if (warned.size > WARNED_CAP) warned.clear()
+  warned.set(session, true)
+  return (
+    `Blocked by block-proxy-artifacts policy (${hit.why}). ` +
+    (first ? FULL_GUIDANCE : TERSE_GUIDANCE)
+  )
+}
+
+const v2Definition: V2.Plugin = {
+  id: "block-proxy-artifacts",
+  async setup(ctx) {
     const warned = new Map<string, boolean>()
-    return {
-      "tool.execute.before": async (input, output) => {
-        const hit = findBlocked(output.args)
-        if (!hit) return
-        const session = input.sessionID ?? "unknown"
-        const first = !warned.has(session)
-        if (warned.size > WARNED_CAP) warned.clear()
-        warned.set(session, true)
-        throw new Error(
-          `Blocked by block-proxy-artifacts policy (${hit.why}). ` +
-          (first ? FULL_GUIDANCE : TERSE_GUIDANCE),
-        )
-      },
-    }
-  }) satisfies Plugin,
+    await ctx.tool.hook("execute.before", (event) => {
+      const message = verdict(event.input, warned, String(event.sessionID ?? "unknown"))
+      if (message) throw new Error(message)
+    })
+  },
+}
+
+const blockProxy = Object.assign(
+  {
+    ...v2Definition,
+    server: (async () => {
+      const warned = new Map<string, boolean>()
+      return {
+        "tool.execute.before": async (input, output) => {
+          const message = verdict(output.args, warned, input.sessionID ?? "unknown")
+          if (message) throw new Error(message)
+        },
+      }
+    }) satisfies V1Plugin,
+  },
   // Introspection surface for tests and other plugins; attached to the
   // default export so the module itself has exactly one export.
   { BLOCKED, strings, findBlocked },

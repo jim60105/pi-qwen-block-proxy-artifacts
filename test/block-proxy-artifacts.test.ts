@@ -31,11 +31,35 @@ const CLEAN_URLS = [
 type BeforeHook = (input: unknown, output: { args: unknown }) => Promise<void>
 
 async function beforeHook(): Promise<BeforeHook> {
-  const factory = blockProxy as unknown as () => Promise<Record<string, BeforeHook>>
-  const hooks = await factory()
+  const entry = blockProxy as unknown as {
+    server: () => Promise<Record<string, BeforeHook>>
+  }
+  const hooks = await entry.server()
   const hook = hooks["tool.execute.before"]
-  assert.ok(hook, "plugin must register tool.execute.before")
+  assert.ok(hook, "plugin must return a tool.execute.before hook from server()")
   return hook
+}
+
+// V2 path: setup(ctx) must register the same enforcement on the tool domain.
+type V2Before = (event: { tool: string; sessionID: string; input: unknown }) => void
+
+async function v2BeforeHook(): Promise<V2Before> {
+  let hook: V2Before | undefined
+  const ctx = {
+    tool: {
+      hook: async (name: string, callback: V2Before) => {
+        if (name === "execute.before") hook = callback
+      },
+    },
+  }
+  const entry = blockProxy as unknown as { setup: (c: unknown) => Promise<void> }
+  await entry.setup(ctx)
+  assert.ok(hook, "plugin setup() must register ctx.tool.hook('execute.before')")
+  return hook!
+}
+
+function v2Event(sessionID: string, input: unknown) {
+  return { tool: "webfetch", sessionID, input }
 }
 
 function nest(depth: number, leaf: unknown): unknown {
@@ -250,13 +274,61 @@ test("self-compatibility: blocklist never matches the plugin's own sources", () 
   }
 })
 
-test("opencode loader contract: single function export (regression: silent plugin death)", async () => {
-  // getLegacyPlugins() in opencode's packages/opencode/src/plugin/index.ts
-  // iterates EVERY module export and throws "Plugin export is not a function"
-  // on any non-function value — the whole plugin then silently does not load
-  // (a live incident dials unblocked; the error only surfaces in the log).
+test("opencode loader contract: single dual-form default export (regression: silent plugin death)", async () => {
+  // V1's loader iterates EVERY module export and accepts only functions or
+  // (since 1.18.29) objects with a callable `server`, throwing
+  // "Plugin export is not a function" otherwise — the whole plugin then
+  // silently does not load (a live incident dials unblocked; the error only
+  // surfaces in the log). V2 reads the default export's `id` and `setup`.
   // Named exports of internals are therefore forbidden.
   const mod = await import("../plugin/block-proxy-artifacts.ts")
   assert.deepEqual(Object.keys(mod), ["default"])
-  for (const entry of Object.values(mod)) assert.equal(typeof entry, "function")
+  const plugin = mod.default
+  assert.equal(typeof plugin, "object")
+  assert.equal(typeof plugin.server, "function", "V1 entrypoint: server()")
+  assert.equal(typeof plugin.setup, "function", "V2 entrypoint: setup(ctx)")
+  assert.equal(typeof plugin.id, "string")
+  assert.ok(plugin.id.length > 0)
+})
+
+test("V2 setup(): hard-blocks the same real call shapes as V1", async () => {
+  const hook = await v2BeforeHook()
+  const blockedShapes: unknown[] = [
+    { url: DEAD_URL, format: "markdown" },
+    { urls: [CLEAN_URLS[0], DEAD_URL], maxCharacters: 5000 },
+    { command: `curl -s ${DEAD_URL} | head` },
+    { prompt: { context: "fetch", urls: [DEAD_URL] } },
+  ]
+  for (const input of blockedShapes) {
+    assert.throws(
+      () => hook(v2Event("v2-blocked", input)),
+      (err: unknown) => {
+        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
+        assert.match(String(err), /Do NOT retry/)
+        return true
+      },
+    )
+  }
+})
+
+test("V2 setup(): lets clean calls through untouched", async () => {
+  const hook = await v2BeforeHook()
+  for (const url of CLEAN_URLS) {
+    hook(v2Event("v2-clean", { url, format: "text", timeout: 120 }))
+  }
+  hook(v2Event("v2-clean", undefined))
+  hook(v2Event("v2-clean", {}))
+})
+
+test("V2 setup(): full guidance once per session, terse repeats", async () => {
+  const hook = await v2BeforeHook()
+  const input = { url: DEAD_URL }
+  const FULL_MARKER = "Go back to the original publisher URL"
+
+  assert.throws(() => hook(v2Event("s1", input)), (e: unknown) => String(e).includes(FULL_MARKER))
+  assert.throws(
+    () => hook(v2Event("s1", input)),
+    (e: unknown) => !String(e).includes(FULL_MARKER) && String(e).includes("Do NOT retry"),
+  )
+  assert.throws(() => hook(v2Event("s2", input)), (e: unknown) => String(e).includes(FULL_MARKER))
 })
