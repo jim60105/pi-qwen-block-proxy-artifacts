@@ -410,15 +410,19 @@ deliberately *unfenced*: production never emits it). Full plan:
   in depth: sinkhole
   the host — both endpoint spellings in `/etc/hosts`:
   `0.0.0.0 routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com` and `0.0.0.0 routify-file-proxy-sg.ap-southeast-1.oss.aliyuncs.com`.
-- **The plugin can die silently.** opencode's plugin loader treats *every*
-  module export as a plugin factory — one stray non-function export (e.g., a
-  helper added for tests) throws `Plugin export is not a function` and the
-  plugin loads as nothing, visible only in `~/.local/share/opencode/log/opencode.log`.
-  This exact failure happened once while testing this repo: enforcement was
-  silently off, and a hallucination dial reached the network (403) during that
-  window. The test suite now includes a loader-contract test (exactly one
-  export, a function) — but after any install or edit, *prove* enforcement
-  with a blocked-host tool call.
+- **The plugin can die silently.** opencode's V1 loader treats *every* module
+  export as a plugin entrypoint and rejects values that are neither functions
+  nor (since 1.18.29) objects with a callable `server` — one stray export
+  (e.g., a helper added for tests) throws `Plugin export is not a function`
+  and the plugin loads as nothing, visible only in
+  `~/.local/share/opencode/log/opencode.log`. This exact failure happened
+  once while testing this repo: enforcement was silently off, and a
+  hallucination dial reached the network (403) during that window. The plugin
+  is dual-interface (V1 `server()` + V2 `id`/`setup()` on one default export;
+  shared enforcement logic, no translated shim); the test suite includes a
+  loader-contract test (exactly one export, carrying both entrypoints) — but
+  after any install or edit, *prove* enforcement with a blocked-host tool
+  call.
 - Nesting deeper than 6 argument levels is not scanned.
 - The block fires when the model *dials* a URL, not when it merely *sees* one;
   the error message teaches it to treat sightings as junk.
