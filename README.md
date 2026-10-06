@@ -550,23 +550,19 @@ BUG CONFIRMED: the model fabricated 42 dead-relay dials (42 reached the network 
 FENCE VERIFIED: 1 attempt, all blocked, none leaked.
 ```
 
-Honest expectations: the ledger's locally recorded dials all come from
-**aggressively quantized** builds of **Qwen3.8-Flash-Next** under
-long-context + failure-wall load — the RadixArk NVFP4 SSD-Stream build
-([garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream](https://huggingface.co/garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream))
-in the September incidents and the EXL3 build named above in all testing.
-Externally, two more builds have since fired: an independently-authored
-NVFP4 quant on DGX Spark, and the **official FP8 release** on a 4-card
-Ampere rig (see the field reports). Only the original BF16 build is
-untested — never put through this task here. So a clean run on any given
-build remains *absence of evidence,
-not evidence of absence*: the decode lottery is real in both directions —
-our own aggressive build has produced 0 and 52 dials on consecutive
-attempts. Use
-`--runs 2-3` and keep the classified URLs with `--evidence out.jsonl`.
-Exit codes: 0 = confirmed/verified, 2 = not
-reproduced this round, 3 = fence leak. Please keep `--fetches` modest if you
-change `--site` — these are public servers.
+Honest expectations: quantization severity is **not** a mitigating factor.
+The template lives in the PLE n-gram table, which every quantizer ships
+byte-identically, and the official FP8 — whose own card promises behavior
+"nearly identical" to the original — fires hard. That our locally recorded
+ledger dials all came from aggressive quants only says which builds we put
+under the failure-wall load. Only BF16 remains untested, and the vendor's
+own identity claim argues *against* it being clean. A clean run on any
+build is therefore *absence of evidence, not evidence of absence*: the
+decode lottery is real in both directions — our build has produced 0 and
+52 dials on consecutive attempts. Use `--runs 2-3` and keep the classified
+URLs with `--evidence out.jsonl`. Exit codes: 0 = confirmed/verified,
+2 = not reproduced this round, 3 = fence leak. Keep `--fetches` modest if
+you change `--site` — these are public servers.
 
 > **TODO (narrowed 2026-09-29).** Run this reproducer against the original
 > BF16 [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) —
