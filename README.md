@@ -31,7 +31,7 @@ under vLLM with MTP(3) speculative decoding):
 | Cost of one fabricated attempt                       | Measured |
 | ---------------------------------------------------- | -------- |
 | decoding the invented URL + JSON call                        | ~1.5–2 s |
-| the tool call itself                                 | **<10 ms** when blocked · 0.2–1 s real DNS/TLS/403 round-trip when not |
+| the tool call itself                                 | **<10 ms** when blocked · 0.2–1 s real DNS/TLS/403 round-trip when not (*isolated*; **median 1.69 s in-run**, p90 2.74 s — field report #3) |
 | recovery: the step that digests the error and re-plans | ~2–3 s |
 | permanent context pollution (call + error text)      | ~190 tokens (chars÷4 heuristic, a floor — a measured external report says ~2×), re-read by **every later step** |
 
@@ -59,7 +59,8 @@ die in <10 ms and produce one-step self-correction (0 same-URL retries ever
 observed with the fence up), but the decode waste and the context pollution
 are paid on every attempt the model chooses to emit. Treat the table above as
 the *fenced floor* — `tools/repro.py --mode raw` shows the unfenced version:
-42 dials in one crawl, every one reaching the network.
+42 dials in one crawl, every one reaching the network, and 69 in the
+stream-instrumented unshielded control of field report #3.
 
 ### Field report #1 — external reproduction on DGX Spark (2026-09-27)
 
@@ -73,7 +74,11 @@ URL once after the 403** (four 403s total). Same-URL retry had never been
 observed with the fence up; unshielded, it appears immediately — exactly the
 retry loop the plugin's "Do NOT retry it" guidance targets.
 
-Four builds, one artifact:
+Six builds, one artifact:
+
+*(Naming: the vendor's hosted product is `qwen3.8-flash`; the hub repos are
+`Qwen3.8-Flash-Next`. Same family — the API and the hub downloads emit the
+identical template.)*
 
 | Build | Quant author · format | Engine · spec-decode | Hardware | Role here |
 | ----- | --------------------- | -------------------- | -------- | --------- |
@@ -81,16 +86,23 @@ Four builds, one artifact:
 | [wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1) | wrldsuksgo2mars · EXL3 ~4.25 bpw | vLLM · MTP(3) | RTX 6000 Blackwell | all plugin development + the 367-attempt cost data |
 | [Mia-AiLab/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4) | local-inference-lab · NVFP4 (mirrored) | vLLM · FP8 KV · MTP(3) | DGX Spark GB10 | external reproduction (4 dials) |
 | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | **official vendor release** · fine-grained FP8 (block 128) | vLLM · FP8 weight path | 4× CMP 170HX GA100 rig · 256 GB · 1M ctx | external reproduction of the **vendor build** (~22 dials in the pasted run) |
+| [wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1) | wrldsuksgo2mars · EXL3 ~4.25 bpw, PLE rows in FP8 | vLLM · YaRN 512K | remote vLLM host | reproduction + the first stream-measured unshielded control (69 dials, field report #3) |
+| Qwen **official API** (`opencode/qwen3.8-flash`) | vendor-served; precision not externally verifiable (FP8 or BF16) | provider-managed | provider-managed | **first API-served reproduction** (46 dials, 2 runs, field report #3) — no third-party quantizer anywhere in the path |
 
-Four independent quant sources — three third-party authors plus the model
-vendor's own FP8 release — across three quant formats (NVFP4, EXL3, FP8),
-two serving engines, three hardware classes: the identical artifact template
-every time. The template is base-model memorization; author, format and
-hardware set dial *rate and style* (a 52-dial burst here, a two-URL pair
-with same-URL retries there, one URL re-dialed in five consecutive fetch
-batches on the FP8 rig). And the FP8 result caps the calibration story: a
-vendor quant whose own model card promises "performance metrics nearly
-identical to those of the original model" dials freely — aggressive
+Four quant authors across five hub builds — the vendor's own FP8 release among
+them — plus the vendor's own hosted API, whose hardware and precision are unknown
+to us: three quant formats (NVFP4, EXL3, FP8), two local serving engines, five
+hardware classes, two opencode client versions (2.0.18 in report #1, 2.0.27 here;
+the incident-era client predates both). The identical artifact template every
+time. vLLM carries all five hub builds; SGLang is confirmed on the EXL3 K4.25
+lineage that produced the original incidents. The template is base-model
+memorization; author, format and hardware set dial *rate and style* (a 52-dial
+burst here, a two-URL pair with same-URL retries there, one URL re-dialed in
+five consecutive fetch batches on the FP8 rig, and 0 same-URL retries across 69
+unshielded dials on the PLE-FP8 build). And the FP8 and API results together cap
+the calibration story: a vendor quant whose own model card promises "performance
+metrics nearly identical to those of the original model" dials freely, and so does
+the vendor's own API — aggressive
 quantization was never a precondition.
 
 Per-attempt cost, our measurements vs. their report:
@@ -100,7 +112,7 @@ Per-attempt cost, our measurements vs. their report:
 | emitting the URL + call | ~1.5–2 s | ~9.2 s mean |
 | unshielded 403 round-trip | 0.2–1 s | 0.68–0.74 s |
 | context pollution per call | ~190 tok (chars÷4 floor) | 424–450 tok (measured, excl. framing) |
-| same-URL retries | never (fence up) | once per URL (unshielded) |
+| same-URL retries | never (fence up) | once per URL (unshielded, that build) — but not a property of being unshielded: 0 of 69 on the PLE-FP8 build, field report #3 |
 
 Caveats: n=4 vs our n=367, and their timing ran under concurrent load —
 compare emission+tool scales, not totals. The scales are consistent: emission is ~6× slower on GB10, ≈ the
@@ -127,6 +139,83 @@ serves those weights through a dequant path) — but the weights are the
 official release, and they fired. **This closes the "only aggressive
 quantization fires" hope**; the original BF16 build is the only one left
 untested (see the TODO under Reproducing the bug).
+
+### Field report #3 — Qwen's own API fires, and in-run cost is ~2× the table (2026-10-14)
+
+A third deployment class — **the vendor's official API, no hub download and no
+third-party quantizer in the path** — plus the first unshielded control measured
+end-to-end from the event stream. Client: opencode v2.0.27. Local arm: remote
+vLLM serving
+[`wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1`](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1)
+(YaRN 512K). Hosted arm: **Qwen's official API** (`opencode/qwen3.8-flash`,
+API-priced).
+
+| Arm | Dials | Leaked | Shape |
+| --- | ----- | ------ | ----- |
+| probe on the local endpoint | — | — | `https://rout` → incident host at mean logprob **−0.00**; generic-URL controls −0.52 / −0.67 |
+| **Qwen official API**, fenced (`--keep-fence`, 2 runs) | **46** (4 then 42) | 0 | canonical host 46/46, signed shape 46/46 |
+| local, fenced (`--keep-fence`, 1 run) | **36** | 0 | canonical host 36/36 |
+| local, **unshielded** (`--standalone`, fence-only-off config) | **69** | **69** | canonical host 69/69; 4 successful crawl fetches |
+
+This is the datum that matters most: **`qwen3.8-flash` here is Qwen's own official
+API**, not a hub download, so no third-party quantizer sits anywhere in the path.
+Whatever precision the vendor serves — FP8 or BF16, not externally verifiable,
+and no `/completions` endpoint with logprobs means `--mode probe` cannot even
+measure its attractor — the model's own served build emits the template. That is
+another confirmation that **quantization does not matter**, and the strongest one
+in this ledger, because the usual escape hatch ("somebody requantized it badly")
+is simply unavailable here. It also moves the exposure claim: the default way most
+people reach this model already fires, so the bug is not confined to operators who
+downloaded an aggressive hub quant.
+
+Two published numbers need qualifying:
+
+1. **The `0.2–1 s` round-trip row is the *isolated* cost, not the cost in a real
+   burst.** Plain `curl` to the incident host from the same box: 0.78–0.85 s
+   total (TLS handshake 0.59–0.65 s) — inside the published band. But per-dial
+   `webfetch` wall time across the 69-dial run: median **1.69 s**, mean 2.09 s,
+   p90 2.74 s, max 9.53 s, **144 s total**. The extra ~0.8 s is *not* explained
+   by the network — a fresh-connection `curl` already pays DNS+TCP+TLS inside
+   0.85 s — and it is not fetch-batch contention either, since this build emitted
+   one dial per step. Candidates are client-side (Bun's fetch path, response
+   handling) or per-call proxying; this run cannot separate them, so treat
+   **1.7 s as the measured in-run figure and the mechanism as open**. Either way
+   the ≈5 s/attempt floor is optimistic for the high-burst sessions the plugin
+   exists to contain.
+2. **The same-URL retry is model behavior, but it is not a property of being
+   unshielded.** This unshielded run re-dialed **0 of 69 URLs**, and that is not
+   the client hiding retries: opencode's `webfetch` issues exactly **one** HTTP
+   request per non-2xx, verified against a local counting server (one hit; error
+   text identical in shape to the crawl's `StatusCode: non 2xx status code
+   (403 GET …)`). The re-dials in reports #1 and #2 were therefore genuinely
+   model-emitted — but "unshielded ⇒ retry loop" narrows to the NVFP4 builds
+   those reports covered.
+
+Everything else corroborates the table: context pollution measured **681 chars
+≈ 170 tokens per dial** against the char÷4 floor (table: ~190), 69 dials ≈
+**11.8k junk tokens**, and the session reported **3,569,359 input tokens**
+re-read across its steps — the compounding tax, observed. Of 76 assistant steps,
+**66 (87%) carried at least one dial**, far above the fleet median of 25% — an
+extreme session, not a new median. Note also that this build emitted **1.0 dial
+per dial-bearing step**, one per step rather than riding along inside a parallel
+fetch batch; the "dials batch with useful work" pattern from the incident
+sessions did not appear here, and that difference is exactly what makes this
+session an outlier on the step-budget metric rather than a typical one.
+
+**Exposure inversion.** In the unshielded session **69 of 73 `webfetch` calls
+went to the third-party relay host and only 4 to the polite crawl target**: the
+real traffic mix is the opposite of the intended one, which is the case for the
+fence stated in network terms rather than token terms.
+
+Two methodology traps from this session are now encoded in `tools/repro.py` (see
+*Reproducing the bug*): a stripped `XDG_CONFIG_HOME` is a **bad** unshielded
+control — it silently drops `AGENTS.md` and every other plugin, and measured 6
+dials where the faithful fence-only-off control measured 69 — and the model spent
+**765 s of the 1109 s run** in five `shell` sleeps (45/120/240/60/300 s) that
+violated the trigger's own no-bash constraint. That stall is failure-wall depth,
+which is the burst mechanism; it is the likeliest reason this arm out-dialed the
+fenced arm rather than any fence effect. Use `--stream-dir` and read the burst
+shape (`.DDDDD.DDDDDDD.DDDDDDDDDDDD…`) before trusting any single number.
 
 ## Why this exists (the incident)
 
@@ -318,17 +407,21 @@ on directly (see **Weights-level surgery** below):
    the model to legitimate discussion of the incident on that alias (you could
    not edit this README from such a session).
  3. **Calibration: rate, not cause — and the rate floor is low.** Every
-    observed firing comes from a quantized build of one model family: four
-    public hub quants — three by independent third-party authors (RadixArk's
-    NVFP4 in the incidents, wrldsuksgo2mars's EXL3 K4.25 in all plugin
-    testing, local-inference-lab's NVFP4 on an external DGX Spark) and,
-    since 2026-09-29, the vendor's own fine-grained FP8 release, externally
-    reproduced with `tools/repro.py` — across two serving engines and three
-    hardware classes. The identical template survives all of that, so it is
-    weights-level memorization of the base model; quantization modulates
-    expression, not content. FP8 — whose card advertises behavior "nearly
-    identical" to the original — already fires hard, so there is **no
-    evidence-backed reason to expect the original BF16 build to be clean**
+    observed firing comes from a build of one model family: five public hub
+    quants — three by independent third-party authors (RadixArk's NVFP4 in the
+    incidents, wrldsuksgo2mars's EXL3 K4.25 in all plugin testing and again in
+    its PLE-FP8 variant, local-inference-lab's NVFP4 on an external DGX Spark)
+    and, since 2026-09-29, the vendor's own fine-grained FP8 release,
+    externally reproduced with `tools/repro.py` — plus, since 2026-10-14,
+    **Qwen's own official API**: vendor-served, precision not externally
+    verifiable, and no third-party quantizer anywhere in the path (field report
+    #3). Two local serving engines, five hardware classes, two
+    opencode client versions: the identical template. It is weights-level
+    memorization of the base model; quantization modulates expression, not
+    content. FP8 — whose card advertises behavior "nearly identical" to the
+    original — already fires hard, and the vendor's own API fires too, which
+    removes the "somebody requantized it badly" escape hatch outright: there is
+    **no evidence-backed reason to expect the original BF16 build to be clean**
     (untested — see the TODO under Reproducing the bug). Context geometry
 doesn't move it either: a paired raw-mode A/B (8 sessions per arm,
 YaRN-extended 512K vs native 256K, `MAX_BATCHED_TOKENS=2048` held
@@ -445,6 +538,7 @@ the rest):
 | **Fence generalization (09-29)** — the surgery's ablated fork free-generated 3 fence-escaping shapes (oversea label, internal form, `.io`); rule 2 broadened same day | 0 (unit-tested shapes, not a live window) | **16/16** unit: all three escaped shapes blocked; prose and other-bucket pass |
 | **Weights-level surgery (09-28/29)** — PLE n-gram row ablation on a byte-verified fork; probe + raw runs, then the two-arm novelty test (`--keep-fence`); verdict: ablation makes protection worse, vaccine abandoned — see Weights-level surgery | 70 leaked by design (raw = shield off); escaping novelty mutants dialed only nonexistent hosts | **437 blocked** in the novelty arms — production arm **253/253**: two rules cover 100% of the production dial space |
 | **Reproducer A/B (09-27)** — `tools/repro.py` raw (`--pure`) vs fenced, same trigger task, quantized local build | raw: **107/107** (all 403); fenced: **0** | fenced: **31/31** |
+| **Port check + API-served reproduction (10-14)** — opencode v2.0.27; Qwen official API (2 runs, fenced), local PLE-FP8 (1 run, fenced), local PLE-FP8 **unshielded** via `--standalone` + fence-only-off config | unshielded: **69/69** (all 403, median 1.69 s in-run); fenced: **0** | fenced: **82/82** (46 API + 36 local) |
 
 **Attribution.** In the direct-to-model control the model spontaneously
 fabricated 61 relay-shaped dials with nothing in the path but the model
@@ -610,7 +704,16 @@ URLs with `--evidence out.jsonl`. Exit codes: 0 = confirmed/verified,
 2 = not reproduced this round, 3 = fence leak. Keep `--fetches` modest if
 you change `--site` — these are public servers.
 
-> **TODO (narrowed 2026-09-29).** Run this reproducer against the original
+> **TODO (narrowed again 2026-10-14).** **Qwen's official API has now been run and
+> fires** (46 dials over 2 runs, field report #3), so the "some third party
+> requantized it" explanation is dead: whatever precision the vendor serves, it
+> emits the template. That closes the *spirit* of the BF16 question but not its
+> letter — API precision is not externally verifiable and exposes no logprob
+> endpoint, so a locally served, precision-verified
+> BF16 [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
+> run is still the only way to state the result for BF16 weights as such.
+>
+> **Original TODO (2026-09-29).** Run this reproducer against the original
 > BF16 [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) —
 > served locally or via the Qwen Cloud API (addable as an
 > `@ai-sdk/openai-compatible` custom provider). Two cheap steps:
@@ -621,9 +724,11 @@ you change `--site` — these are public servers.
 > spontaneous rate. Field report #2 left only this build untested: a vendor
 > quant advertising "nearly identical" behavior already fires, so the
 > expectation for BF16 is **same attractor; rate under load unknown, not
-> presence**. Exposure note, refreshed 2026-09-29: **305 quantized
-derivatives** (up from 292 four days ago) on the hub, all public downloads — and the firing list now includes the official
-> release itself.
+> presence**. Exposure note, refreshed 2026-09-29: **305 quantized derivatives**
+> (up from 292 four days ago) on the hub, all public downloads — and the firing
+> list now includes the official release itself. Refreshed 2026-10-14: it also
+> now includes **the vendor's own API**, which is the path most users take
+> without ever downloading a quant.
 
 ## Development
 
