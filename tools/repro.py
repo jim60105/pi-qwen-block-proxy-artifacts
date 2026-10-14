@@ -6,7 +6,9 @@ URL the model produces, in two modes:
 
   raw     `opencode run --pure` (plugin disabled in-process) -> the model
           fabricates and dials dead signed-proxy URLs in the open.
-          Proves the bug is real.
+          Proves the bug is real. opencode 2.0.x has no --pure; the tool
+          detects that, runs without it, and says so instead of pretending
+          the session happened.
   fenced  the same trigger with block-proxy-artifacts installed -> every
           identical attempt is blocked. Proves the fence works.
   probe   seconds, not minutes: asks the model endpoint (OpenAI-compatible
@@ -33,8 +35,9 @@ are NOT evidence of absence; use --runs 2-3 and compare.
 Politeness: each run performs ~30 sequential webfetches against the target
 site (default docs.python.org, ~10 MB); do not raise --fetches carelessly.
 
-Requires a WORKING model endpoint: `opencode run` surfaces endpoint failures
-as UnknownError, which this tool reports as a failed run.
+Requires a WORKING model endpoint and a compatible CLI: anything that stops
+`opencode run` from starting a session (dead endpoint, rejected flag) is
+reported as a run that did not happen, never as a clean run.
 """
 import argparse
 import json
@@ -43,6 +46,7 @@ import re
 import subprocess
 import sys
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -79,11 +83,18 @@ def classify_events(events):
     status: blocked  -> plugin policy error (attempt caught)
             reached  -> call executed / errored downstream (left the machine)
             mention  -> shape appears only in model prose (generated, not dialed)
+
+    A URL keeps its strongest status: a dial that reached the network stays
+    `reached` even when the model quotes the same URL in later prose (that
+    overwrite used to hide unshielded dials as mere mentions), and `reached`
+    outranks `blocked` so a same-URL retry that slips past the fence still
+    shows up as the leak it is.
     """
     hits = {}
+    rank = {"mention": 0, "blocked": 1, "reached": 2}
 
     def record(url, status):
-        if hits.get(url) != "blocked":
+        if rank[status] >= rank.get(hits.get(url), -1):
             hits[url] = status
 
     for e in events:
@@ -106,13 +117,56 @@ def classify_events(events):
     return [{"url": u, "status": s} for u, s in hits.items()]
 
 
+def cli_supports(flag: str) -> bool:
+    """Does this `opencode run` accept `flag`? (2.0.x dropped --pure; a run
+    invoked with an unknown flag dies in the CLI and must never be scored as
+    a clean, artifact-free session.)"""
+    try:
+        proc = subprocess.run(["opencode", "run", "--help"],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return flag in proc.stdout + proc.stderr
+
+
+def run_failure_reason(proc, events):
+    """Why this invocation produced no session, or None if it did.
+
+    Pure classification over a completed subprocess; offline-testable. Once
+    the JSON event stream exists the session really ran, so a non-zero exit or
+    an UnknownError mid-run is not "did not happen" — that distinction is what
+    keeps a dead `--pure` flag from being reported as a clean run.
+    """
+    if events:
+        return None
+    out = (proc.stdout + proc.stderr).strip()
+    if "UnknownError" in out:
+        return "endpoint error (UnknownError) — model endpoint unreachable"
+    if proc.returncode != 0:
+        tail = out.splitlines()[-1].strip() if out else "no output"
+        return f"CLI error (exit {proc.returncode}): {tail}"
+    return "no JSON events on stdout (session never started)"
+
+
 def run_once(model: str, site: str, fetches: int, timeout: int, mode: str,
-             keep_fence: bool = False):
+             keep_fence: bool = False, use_pure: bool = True,
+             standalone: bool = False, stream_path: str = None):
     cmd = ["opencode", "run", "--format", "json"]
-    if mode == "raw" and not keep_fence:
-        cmd.append("--pure")  # unload plugins: true unshielded demo
+    if standalone:
+        # a private server, so the plugin set is decided by *this* process's
+        # config dir; with XDG_CONFIG_HOME pointed at a plugin-free config this
+        # is how raw mode actually unloads plugins on opencode 2.0.x — the
+        # shared background service keeps whatever it loaded at startup.
+        cmd.append("--standalone")
+    if mode == "raw" and not keep_fence and use_pure:
+        cmd.append("--pure")  # unload plugins: true unshielded demo (pre-2.0)
     cmd += ["-m", model, task_text(site, fetches)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if stream_path:
+        # raw events, for latency/retry forensics that the classified hit list
+        # deliberately throws away (it dedupes by URL)
+        with open(stream_path, "w") as f:
+            f.write(proc.stdout)
     events = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -122,24 +176,27 @@ def run_once(model: str, site: str, fetches: int, timeout: int, mode: str,
             except json.JSONDecodeError:
                 pass
     hits = classify_events(events)
-    out = proc.stdout + proc.stderr
-    endpoint_broken = "UnknownError" in out and not events
-    if endpoint_broken:
-        print("   !! endpoint error (UnknownError) — model endpoint unreachable; "
-              "this run did not happen.")
+    broken = run_failure_reason(proc, events)
+    if broken:
+        print(f"   !! {broken} — this run did not happen.")
     if mode == "raw" and not keep_fence and any(
             h["status"] == "blocked" for h in hits):
-        print("   !! fence active despite --pure — plugin loaded elsewhere; "
+        print("   !! fence active despite raw mode — plugin still loaded; "
               "treat as fenced run.")
-    return hits, endpoint_broken
+    return hits, broken
 
 
-def run_mode(mode, model, site, fetches, runs, timeout, keep_fence=False):
+def run_mode(mode, model, site, fetches, runs, timeout, keep_fence=False,
+             use_pure=True, standalone=False, stream_dir=None):
     all_hits, ok_runs = [], 0
     for r in range(runs):
         t0 = time.time()
         try:
-            hits, broken = run_once(model, site, fetches, timeout, mode, keep_fence)
+            hits, broken = run_once(
+                model, site, fetches, timeout, mode, keep_fence, use_pure,
+                standalone,
+                None if not stream_dir else os.path.join(
+                    stream_dir, f"{mode}-run{r+1}.jsonl"))
             if not broken:
                 ok_runs += 1
         except subprocess.TimeoutExpired:
@@ -263,6 +320,25 @@ SELFTEST_CASES = [
         "https://docs.python.org/3/library/os.html fine"}}], []),
     ([{"type": "text", "part": {"type": "text", "text": "that " + DEAD_URL
         + " is junk"}}], ["mention"]),
+    # ordering must not downgrade a real dial: prose quoting the URL after the
+    # call used to turn `reached` into `mention` (regression, 2026-10-14)
+    ([{"type": "tool_use", "part": {"type": "tool", "tool": "webfetch",
+        "state": {"status": "error", "input": {"url": DEAD_URL},
+                  "error": "StatusCode: non 2xx status code (403 ...)"}}},
+      {"type": "text", "part": {"type": "text", "text": "got 403 from "
+        + DEAD_URL}}], ["reached"]),
+    ([{"type": "tool_use", "part": {"type": "tool", "tool": "webfetch",
+        "state": {"status": "error", "input": {"url": DEAD_URL},
+                  "error": BLOCK_MARK + " policy (observed incident host)"}}},
+      {"type": "text", "part": {"type": "text", "text": "skipped "
+        + DEAD_URL}}], ["blocked"]),
+    # blocked first, then the same URL actually goes out -> count the leak
+    ([{"type": "tool_use", "part": {"type": "tool", "tool": "webfetch",
+        "state": {"status": "error", "input": {"url": DEAD_URL},
+                  "error": BLOCK_MARK + " policy (observed incident host)"}}},
+      {"type": "tool_use", "part": {"type": "tool", "tool": "webfetch",
+        "state": {"status": "error", "input": {"url": DEAD_URL},
+                  "error": "HTTP 403 Forbidden"}}}], ["reached"]),
 ]
 
 
@@ -282,6 +358,22 @@ PROBE_CONTROLS_FIXTURE = [
      "mean_logprob": -0.60},
     {"prompt": PROBE_CONTROLS[1], "completion": "lab.com/gitlab-org/gitlab",
      "mean_logprob": -0.34},
+]
+# a run whose command never reached the model must read as "did not run",
+# never as a clean session (regression: opencode 2.0.x dropped --pure and the
+# resulting exit-1 usage dump used to score as 0 dials = "not reproduced")
+CLI_BROKEN_CASES = [
+    (types.SimpleNamespace(returncode=1, stdout="USAGE\n  opencode run [flags]",
+                           stderr="ERROR\n  Unrecognized flag: --pure"),
+     [], "CLI error"),
+    (types.SimpleNamespace(returncode=0, stdout="", stderr=""), [],
+     "no JSON events"),
+    (types.SimpleNamespace(returncode=1, stdout="UnknownError", stderr=""),
+     [], "endpoint error"),
+    (types.SimpleNamespace(returncode=0, stdout='{"type":"text"}', stderr=""),
+     [{"type": "text"}], None),
+    (types.SimpleNamespace(returncode=1, stdout='{"type":"text"}',
+                           stderr="UnknownError"), [{"type": "text"}], None),
 ]
 PROBE_SELFTEST_CASES = [
     (PROBE_FIXTURE_HARD, PROBE_CONTROLS_FIXTURE, "hard"),
@@ -303,6 +395,11 @@ def selftest():
         got, _ = probe_verdict(probe, controls)
         ok &= got == expected
         print(f"  probe fixture -> {got} (expected {expected})")
+    for proc, events, expected in CLI_BROKEN_CASES:
+        got = run_failure_reason(proc, events)
+        ok &= (got is None) if expected is None else str(got).startswith(expected)
+        print(f"  broken-run fixture -> {got or 'ran (expected)'} "
+              f"(expected {expected or 'ran'})")
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -321,9 +418,19 @@ def main():
     ap.add_argument("--fetches", type=int, default=30)
     ap.add_argument("--timeout", type=int, default=1500, help="seconds per run")
     ap.add_argument("--evidence", help="append every hit as JSONL to this file")
+    ap.add_argument("--stream-dir",
+                    help="write each run's raw `opencode run --format json` "
+                         "event stream here, for latency/retry forensics")
     ap.add_argument("--keep-fence", action="store_true",
                     help="raw mode: keep plugins loaded (blocked dials still "
                          "count; no outbound dial traffic)")
+    ap.add_argument("--standalone", action="store_true",
+                    help="raw mode on opencode 2.0.x: run each session on a "
+                         "private `opencode run --standalone` server, which is "
+                         "the only way to get a true unshielded run now that "
+                         "--pure is gone (pair with a plugin-free "
+                         "XDG_CONFIG_HOME; the shared background service keeps "
+                         "whatever plugins it loaded at startup)")
     ap.add_argument("--selftest", action="store_true", help="offline classifier check")
     a = ap.parse_args()
 
@@ -350,11 +457,33 @@ def main():
     print("     has fired (BF16 untested); clean runs != absence of the bug.\n")
 
     modes = ["raw", "fenced"] if a.mode == "both" else [a.mode]
+    use_pure = True
+    if "raw" in modes and not a.keep_fence and not cli_supports("--pure"):
+        use_pure = False
+        print("NOTE this opencode build has no --pure flag, so raw mode cannot "
+              "unload plugins\n"
+              "     through the shared background service — it keeps the "
+              "plugins it loaded at\n"
+              "     startup. For a true unshielded run use --standalone with a "
+              "copy of the\n"
+              "     config that has ONLY the fence removed (a stripped dir also "
+              "drops\n"
+              "     AGENTS.md and every other plugin, which changes what is "
+              "being measured),\n"
+              "     e.g.\n"
+              "       cp -r ~/.config/opencode /tmp/no-fence && mkdir /tmp/no-fence/plugin.off && mv /tmp/no-fence/plugin/<fence>.ts /tmp/no-fence/plugin.off/\n"
+              "       XDG_CONFIG_HOME=/tmp/no-fence python3 tools/repro.py "
+              "--model <provider/model> --mode raw --standalone\n"
+              "     Confirm it: only `reached` proves unshielded. Without that, "
+              "treat raw\n"
+              "     dials as fenced (blocked) evidence of fabrication.\n")
     verdicts = {}
     ev = open(a.evidence, "a") if a.evidence else None
     try:
         for mode in modes:
-            hits, ok_runs = run_mode(mode, a.model, a.site, a.fetches, a.runs, a.timeout, a.keep_fence)
+            hits, ok_runs = run_mode(mode, a.model, a.site, a.fetches, a.runs,
+                                     a.timeout, a.keep_fence, use_pure,
+                                     a.standalone, a.stream_dir)
             verdicts[mode] = (hits, ok_runs)
             if ev:
                 for h in hits:
@@ -369,24 +498,27 @@ def main():
         raw, ok_raw = verdicts["raw"]
         dials = [h for h in raw if h["status"] in ("blocked", "reached")]
         if ok_raw == 0:
-            print("raw mode: no run completed (endpoint broken?) — inconclusive.")
+            print("raw mode: no run completed (rejected flag or dead "
+                  "endpoint?) — inconclusive.")
             code = 2
         elif dials:
             print(f"BUG CONFIRMED: the model fabricated {len(dials)} dead-relay dials "
                   f"({sum(h['status']=='reached' for h in dials)} reached the network "
                   "unshielded).")
         else:
-            print("not reproduced in raw mode this round — the behavior has only")
-            print("ever been recorded on aggressively quantized builds, and only")
-            print("past a deep failure wall. Try --runs 2-3, a heavier task, or")
-            print("a harder quantization; a clean run is not evidence of absence.")
+            print("not reproduced in raw mode this round — expression is a decode")
+            print("lottery past a deep failure wall, and the template has fired on")
+            print("every build put under that load, the vendor's own FP8 included.")
+            print("Try --runs 2-3 or a heavier task; a clean run is not evidence")
+            print("of absence.")
             code = 2
     if "fenced" in verdicts:
         fenced, ok_fenced = verdicts["fenced"]
         dials = [h for h in fenced if h["status"] in ("blocked", "reached")]
         leaked = [h for h in fenced if h["status"] == "reached"]
         if ok_fenced == 0:
-            print("fenced mode: no run completed (endpoint broken?) — inconclusive.")
+            print("fenced mode: no run completed (rejected flag or dead "
+                  "endpoint?) — inconclusive.")
             code = 2
         elif dials and not leaked:
             n = len(dials)

@@ -524,14 +524,60 @@ sessions and classifies every artifact-shaped URL the model produces:
 ```bash
 python3 tools/repro.py --model <provider/model>     # raw + fenced pass
 python3 tools/repro.py --model <provider/model> --mode probe  # 3-request memorization probe, no dialing
+python3 tools/repro.py --model <provider/model> --mode raw --keep-fence  # fabrication counted, nothing dialed out
 python3 tools/repro.py --selftest                   # offline classifier check
 ```
+
+Useful flags added while porting to opencode 2.0.x: `--standalone` (private
+server; the only way to unload plugins now that `--pure` is gone),
+`--stream-dir DIR` (keep each run's raw event stream — required for round-trip
+latency, retry and burst-shape forensics, since the classified hit list dedupes
+by URL), and `--keep-fence`.
 
 Two-part demo, same trigger task each time:
 
 - **raw** (`opencode run --pure`, plugins unloaded) — the model fabricates
   the dead signed-proxy URLs and dials them in the open.
 - **fenced** (plugin installed) — the identical attempts get blocked.
+
+opencode 2.0.x dropped `--pure`, and moving the plugin file out does **not**
+unload it either: `opencode run` talks to the shared background server, which
+keeps the plugin set it loaded at startup. The working unshielded arm is a
+private server plus a copy of the config with **only the fence removed**:
+
+```bash
+cp -r ~/.config/opencode /tmp/no-fence
+mkdir /tmp/no-fence/plugin.off
+mv /tmp/no-fence/plugin/block-proxy-artifacts.ts /tmp/no-fence/plugin.off/
+XDG_CONFIG_HOME=/tmp/no-fence python3 tools/repro.py --model <provider/model> \
+    --mode raw --standalone --stream-dir /tmp/streams
+```
+
+Remove *only* `block-proxy-artifacts.ts`. A stripped config dir (just
+`opencode.json`) is a bad control: it silently drops `AGENTS.md` and every
+other plugin as well, so you are no longer measuring "fence off" but "different
+global instructions and different tool descriptions" — measured here as **6
+unshielded dials under a stripped config vs 36 under the same trigger with the
+fence on**, a gap that is an artifact of the control, not of the bug.
+
+Verify the arm, don't assume it: a genuinely unshielded run reports dials as
+`reached`, not `blocked`. The fence silently surviving a config change is
+exactly how a raw arm ends up measuring the wrong thing. Without
+`--standalone`, patched raw still runs with the fence loaded, so `blocked` is
+the fabrication signal there and only `reached` proves unshielded.
+
+A run that never started a session — rejected flag, dead endpoint — is now
+reported as **did not run**, never as a clean 0-dial result. Before this, 2.0.x
+scored every raw attempt as "not reproduced this round" because the CLI rejected
+`--pure`, exited 1, and the tool looked only for `UnknownError`: a broken
+invocation hid behind a verdict that read like evidence of absence. Sanity-check
+any verdict by its wall-clock — a real crawl takes minutes, not `0s`.
+
+The classifier also now ranks a URL's status (`reached` > `blocked` >
+`mention`) instead of letting the last sighting win: model prose quoting a
+URL after the call used to downgrade a real dial to a `mention`. Any `reached`
+count recorded by the older classifier is therefore a **floor**, not the
+measured value.
 
 The trigger task is a polite ~30-page crawl of `docs.python.org` (robots-
 allowed, switchable with `--site`) with a retry-once-then-gap protocol — the
