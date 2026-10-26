@@ -296,7 +296,7 @@ publisher URL", and every token of guidance is re-read by every later step,
 so the list was dropped 2026-09-29 (~22 tok saved once per session; the
 per-burst one-liners are the bigger context lever, ~40 tok each).
 
-**Why two rules, both host-anchored.** Of the 371 recorded dials, 368 hit
+**Why the rules are host-anchored.** Of the 371 recorded dials, 368 hit
 the same relay bucket label, `routify-file-proxy-sg` — 365 via the public
 endpoint spelling, and — caught on camera 2026-09-26 under maximum
 forced-wall load — 2 via the **dual-stack** spelling
@@ -347,6 +347,28 @@ unrelated companies named "Routify", and local `proxy_temp_file` paths are
 **not** blocked. Keep any pattern you add equally narrow, and keep `npm test`
 green — one test asserts no regex matches this repository's own sources, so an
 agent can always edit the plugin itself.
+
+**Rules 3-4 (2026-10-26, Cohere field capture).** Cohere's cyber team caught
+the same model family doing something worse than fetching: running machine
+recon (`ls /tmp`, tool inventory, `resolv.conf`) and attempting a `curl -X
+PUT` *upload* to a different Aliyun bucket in Beijing
+(`sanmaohe.oss-cn-beijing[.]aliyuncs.com`), while sampling the cloud
+instance-metadata addresses (`169[.]254[.]169[.]254`, Alibaba's
+`100[.]100[.]100[.]200`, `metadata[.]google[.]internal`) in up to a third of
+deep-curl prefills. Rule 3 pins the captured upload bucket — narrowly: the
+bucket label *and* an aliyuncs endpoint, since the bare label completes to
+an unrelated blog in local probes and other cn-beijing buckets are
+legitimate. Rule 4 blocks the metadata/credential surface. Neither shape has
+any dedicated n-gram-table entry in our build (forward-hash collision scan,
+2026-10-26: overlap with the template's rows is purely via shared
+`aliyuncs` endpoint trigrams), so these are *behavioral-tail* fences, not
+template fences — which is also why rule 3 stays single-host until a second
+capture says otherwise. Guidance is per-rule: telling a model to "fetch the
+publisher URL instead" is wrong advice for an upload endpoint and an IMDS
+address. Our own ladder replication of Cohere's prefill study (1600 samples,
+EXL3 K4.25) found no watchlist ignition and zero `sanmaohe` completions, but
+did spontaneously reproduce metadata-address reaches at 2-6% of deep-rung
+samples — rule 4 earns its place behaviorally, not structurally.
 
 **Why a plugin, not config?** opencode's `permission.webfetch` is a flat
 allow/ask/deny for *all* fetches — no per-domain rules — and wouldn't cover MCP
@@ -501,7 +523,8 @@ deliberately *unfenced*: production never emits it). Full plan:
   relay that replaces long outputs with signed links) leave those links in
   the transcript; the plugin stops re-dialing but can't erase them. Defense
   in depth: sinkhole
-  the host — both endpoint spellings in `/etc/hosts`:
+  the hosts — both relay endpoint spellings, and since 2026-10-26 the
+  Beijing upload bucket too, in `/etc/hosts`:
   `0.0.0.0 routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com` and `0.0.0.0 routify-file-proxy-sg.ap-southeast-1.oss.aliyuncs.com`.
 - **The plugin can die silently.** opencode's V1 loader treats *every* module
   export as a plugin entrypoint and rejects values that are neither functions
@@ -744,11 +767,13 @@ npm run typecheck  # tsc --noEmit
 npm run repro:selftest  # offline check of tools/repro.py's classifier
 ```
 
-Test coverage: both rules (exact incident host; the `routify-file-*` host
-family — oversea label, internal endpoint, `.io` variant all blocked),
-case-insensitivity, near-miss
+Test coverage: all four rules (exact incident host; the `routify-file-*` host
+family — oversea label, internal endpoint, `.io` variant all blocked; the
+2026-10-26 upload bucket, narrowly; the metadata/IMDS addresses with boundary
+guards), case-insensitivity, near-miss
 pass-through (legit OSS buckets, a relay operator's signed `proxy_temp_file`
-export, "Routify" the company), depth-cap boundaries, object-key scanning,
+export, "Routify" the company), per-rule guidance (family-specific full/terse
+text; legacy publisher guidance unchanged), depth-cap boundaries, object-key scanning,
 empty/odd argument shapes, the exact incident call shapes (webfetch, MCP
 `urls` array, `bash curl`, nested subagent prompt), the self-compatibility
 guard, and the loader-contract test mirroring opencode's `getLegacyPlugins`.
