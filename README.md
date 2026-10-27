@@ -368,7 +368,10 @@ publisher URL instead" is wrong advice for an upload endpoint and an IMDS
 address. Our own ladder replication of Cohere's prefill study (1600 samples,
 EXL3 K4.25) found no watchlist ignition and zero `sanmaohe` completions, but
 did spontaneously reproduce metadata-address reaches at 2-6% of deep-rung
-samples — rule 4 earns its place behaviorally, not structurally.
+samples — rule 4 earns its place behaviorally, not structurally. Full
+replication study — 229k-sample ignition grid, 369 novel plumbing hosts,
+substrate collision scans, and an assessment of the report's public critics:
+**[`COHERE-2026-10-26.md`](COHERE-2026-10-26.md)**.
 
 **Why a plugin, not config?** opencode's `permission.webfetch` is a flat
 allow/ask/deny for *all* fetches — no per-domain rules — and wouldn't cover MCP
