@@ -14,28 +14,22 @@ upstream rather than copied here. OpenCode support remains upstream.
 
 ## Install
 
-From a checkout of this repository, choose your host:
+Install the package directly from GitHub:
 
 ```bash
 # omp
-omp install .
+omp install https://github.com/jim60105/pi-qwen-block-proxy-artifacts
 
 # pi
-pi install ./
+pi install https://github.com/jim60105/pi-qwen-block-proxy-artifacts
 ```
 
-Local installation references the checkout without copying it. Keep the
-checkout at that location and restart the host after installing. No
-`npm install` or build step is required to use the extension.
+Both package managers fetch the repository and register the extension without
+a local clone. Restart the host after installing. No build step or runtime
+dependencies are required.
 
-For one session without changing installed packages:
-
-```bash
-omp --no-extensions -e .
-pi --no-extensions -e ./plugin/block-proxy-artifacts.ts
-```
-
-Alternatively, copy `plugin/block-proxy-artifacts.ts` into a discovery directory:
+Alternatively, download `plugin/block-proxy-artifacts.ts` and place it in a
+discovery directory:
 
 | Host | Global directory | Project directory |
 | --- | --- | --- |
@@ -43,7 +37,7 @@ Alternatively, copy `plugin/block-proxy-artifacts.ts` into a discovery directory
 | omp | `~/.omp/agent/extensions/` | `.omp/extensions/` |
 
 Omp profiles and agent-directory overrides change the global directory.
-Pi supports `/reload` for rediscovery; restart omp after copying or editing
+Pi supports `/reload` for rediscovery; restart omp after adding or editing
 an extension file.
 
 ## Behavior
