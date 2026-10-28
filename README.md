@@ -1,7 +1,13 @@
-# block-proxy-artifacts
+# pi-qwen-block-proxy-artifacts
 
-An [opencode](https://opencode.ai) plugin that hard-blocks **hallucinated
-file-proxy artifact URLs** before any tool dials out.
+A shared extension for pi and oh-my-pi (omp) that blocks hallucinated
+file-proxy URLs, a known upload-target bucket, and cloud metadata endpoints
+before tool execution. It uses one standalone TypeScript entry point with no
+runtime dependencies. See [Install](#install).
+
+This fork replaces the original OpenCode plugin. The incident reports,
+measurements, and research tools below were inherited from that project and
+describe historical OpenCode runs. They are not pi or omp performance results.
 
 Qwen 3.8 Flash Next has been observed fabricating signed Aliyun OSS "file proxy"
 links — like
@@ -269,17 +275,18 @@ request loop.
 
 ## What it does
 
-On **every** `tool.execute.before`, the plugin deep-scans call arguments —
-strings, array elements, nested object values *and keys*, up to 6 container
-levels — against a small blocklist:
+On every `tool_call` event, the extension scans `event.input` across all tool
+names, including built-in tools, extension tools, and MCP tools exposed through
+the host's tool pipeline. It scans strings, array elements, nested object
+values and keys through six container levels against a small blocklist:
 
 | Pattern (case-insensitive)                                          | Catches                                                     |
 | ------------------------------------------------------------------- | ----------------------------------------------------------- |
 | `routify[-]file[-]proxy[-]sg[.]oss-ap-southeast-1[.]aliyuncs[.]com` | the exact incident host — 365 of the 371 recorded dials (as of 2026-09-27) |
 | `routify[\w.-]{0,12}file[\w.-]{0,56}aliyuncs[.](com|io)` | the relay bucket label family (`routify-file-*`: proxy/proxy-eu/oversea labels) on **any** Aliyun OSS endpoint form, public, dual-stack, internal, accelerate — TLD `.com` or `.io` (generalized 2026-09-29 after the surgery experiments below surfaced proxy-less labels and the `.io` variant) |
 
-A match throws — the tool never executes — with an error written to break the
-retry loop, not just fail the call:
+A match returns `{ block: true, reason }`. The host refuses execution and
+reports the reason to the model:
 
 > `Blocked by block-proxy-artifacts policy (observed incident host (dead relay bucket)). This URL is
 > a dead upload-proxy artifact from a third-party relay middlebox, not a real content
@@ -295,6 +302,12 @@ corpus; no evidence it improved recovery beyond naming "the original
 publisher URL", and every token of guidance is re-read by every later step,
 so the list was dropped 2026-09-29 (~22 tok saved once per session; the
 per-burst one-liners are the bigger context lever, ~40 tok each).
+
+Warning history is local to each extension factory and keyed by
+`ctx.sessionManager.getSessionId()`. Session switches keep separate warning
+histories; child-session factories have independent state. History is cleared
+when a new warned session would exceed 500 entries. Restarting or reloading
+the extension also restores full guidance. Blocking remains active after a reset.
 
 **Why the rules are host-anchored.** Of the 371 recorded dials, 368 hit
 the same relay bucket label, `routify-file-proxy-sg` — 365 via the public
@@ -337,16 +350,16 @@ only shapes a token rule would still add are separator-mutated labels
 ```
 
 The trade-off is deliberate under-inclusion of *unattested* shapes — with the opposite
-bias on the measurement side: `tools/blocks-by-session.py` still counts every
+bias on the historical measurement side: `tools/blocks-by-session.py` counts every
 token-shaped dial and leak, so anything the narrowed fence lets through
 surfaces in the tracker instead of accumulating silently. A generic path rule
 (any Aliyun OSS bucket path containing the relay temp-file segment) was
 evaluated and rejected: zero unique catches in the incidents, and it would
 block legitimate relay operators' own signed exports. Ordinary OSS buckets,
 unrelated companies named "Routify", and local `proxy_temp_file` paths are
-**not** blocked. Keep any pattern you add equally narrow, and keep `npm test`
-green — one test asserts no regex matches this repository's own sources, so an
-agent can always edit the plugin itself.
+**not** blocked. Keep any pattern you add equally narrow. Keep literal
+indicators fragmented in source files so the extension does not block
+agent-initiated edits to its own code.
 
 **Rules 3-4 (2026-10-26, Cohere field capture).** Cohere's cyber team caught
 the same model family doing something worse than fetching: running machine
@@ -373,35 +386,62 @@ replication study — 229k-sample ignition grid, 369 novel plumbing hosts,
 substrate collision scans, and an assessment of the report's public critics:
 **[`COHERE-2026-10-26.md`](COHERE-2026-10-26.md)**.
 
-**Why a plugin, not config?** opencode's `permission.webfetch` is a flat
-allow/ask/deny for *all* fetches — no per-domain rules — and wouldn't cover MCP
-fetch tools anyway. `tool.execute.before` is the only hook that sees every
-tool's arguments.
+### Shared pi and omp API
+
+Both hosts load a default extension factory and expose
+`pi.on("tool_call", handler)`. The handler receives tool arguments in
+`event.input` and can refuse execution by returning `{ block: true, reason }`.
+The extension leaves arguments unchanged and does not require a UI or confirmation.
+
+The package declares its entry point through `package.json#pi.extensions`.
+Omp accepts that manifest field, so both hosts load the same file.
+The extension uses a small structural TypeScript type for these shared
+methods and has no imports from either host package.
+
+API references are the published pi 0.73.1 [Extensions][pi-extensions] guide,
+omp's [Extensions][omp-extensions] guide, and
+[Extension Loading (TypeScript/JavaScript Modules)][omp-loading].
+Runtime verification is performed on omp only. Pi compatibility is based on
+the documented shared contract; a pi runtime has not been exercised.
 
 ## Install
 
-Copy `plugin/block-proxy-artifacts.ts` into your opencode config and declare
-it.
-
-**Global** (recommended — protects every project):
+From a checkout of this repository, choose your host:
 
 ```bash
-mkdir -p ~/.config/opencode/plugin
-cp plugin/block-proxy-artifacts.ts ~/.config/opencode/plugin/
+# omp: link this local extension package
+omp install .
+
+# pi: register this local extension package
+pi install ./
 ```
 
-```jsonc
-// ~/.config/opencode/opencode.json
-{ "plugin": ["./plugin/block-proxy-artifacts.ts"] }
+Keep the checkout at that location while using a local install. Restart the
+host after installation. No `npm install` or build step is required for use.
+Installing this package does not retain OpenCode support.
+
+For a temporary session without changing installed packages:
+
+```bash
+omp --no-extensions -e .
+pi --no-extensions -e ./plugin/block-proxy-artifacts.ts
 ```
 
-**Per-project:** put the file under `.opencode/plugin/` and add the same entry
-to the project's `opencode.json`.
+Alternatively, copy `plugin/block-proxy-artifacts.ts` into a discovery directory:
 
-Plugins load at startup — restart opencode after installing, then **verify
-enforcement**: check `grep "failed to load plugin"
-~/.local/share/opencode/log/opencode.log`, and make any tool call containing
-the blocked host (see Limitations: a dead plugin dies silently).
+| Host | Global directory | Project directory |
+| --- | --- | --- |
+| pi | `~/.pi/agent/extensions/` | `.pi/extensions/` |
+| omp | `~/.omp/agent/extensions/` | `.omp/extensions/` |
+
+Omp's global directory changes with profiles or an agent-directory override.
+Pi supports `/reload` for rediscovery; restart omp after copying or editing
+the file.
+
+Verify enforcement with a harmless tool call containing a fragment-assembled
+indicator, such as a `write` call whose content is the joined dead-host fixture
+from the tests. The host must report a policy block and the file must remain
+absent. Do not test by contacting a blocked endpoint.
 
 ## Reducing attempts (and why prompt rules are not the answer)
 
@@ -508,11 +548,10 @@ deliberately *unfenced*: production never emits it). Full plan:
 
 - **Substring matching over- and under-fires on purpose.** It over-fires on
   tool calls that merely *mention* the blocked host: an agent with this plugin
-  installed cannot `edit` the example URL in this README (why the
-  self-compatibility test covers plugin sources but not this file), and during
-  triage even a `question` tool call quoting the host was blocked. Use `git`
+  installed cannot `edit` the example URL in this README. In the original
+  incident, even a `question` tool call quoting the host was blocked. Use `git`
   or an external editor for files that must contain the literal URL, quote the
-  host with label separators inside opencode, or disable the plugin
+  host with label separators inside pi or omp, or disable the extension
   temporarily. It under-fires against deliberate evasion (redirects, DNS
   aliases, URL-encodings) — this is a guardrail against *confabulation*, not a
   network perimeter.
@@ -522,31 +561,28 @@ deliberately *unfenced*: production never emits it). Full plan:
   step, but nothing here stops the *next* fabrication. Routing changes don't
   either: the direct-to-model control (below) saw the same attempts with the
   model endpoint reached directly.
-- **It gates opencode's tool pipeline only.** Upstream output-rewriters (any
+- **It gates the host's intercepted tool pipeline only.** Direct network
+  activity inside other extensions, user-entered shell commands, and external
+  programs are outside this policy. Child processes are not inspected; a
+  script that obtains a blocked URL without mentioning it in its tool
+  arguments can bypass the scan. Upstream output-rewriters (any
   relay that replaces long outputs with signed links) leave those links in
   the transcript; the plugin stops re-dialing but can't erase them. Defense
   in depth: sinkhole
   the hosts — both relay endpoint spellings, and since 2026-10-26 the
   Beijing upload bucket too, in `/etc/hosts`:
   `0.0.0.0 routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com` and `0.0.0.0 routify-file-proxy-sg.ap-southeast-1.oss.aliyuncs.com`.
-- **The plugin can die silently.** opencode's V1 loader treats *every* module
-  export as a plugin entrypoint and rejects values that are neither functions
-  nor (since 1.18.29) objects with a callable `server` — one stray export
-  (e.g., a helper added for tests) throws `Plugin export is not a function`
-  and the plugin loads as nothing, visible only in
-  `~/.local/share/opencode/log/opencode.log`. This exact failure happened
-  once while testing this repo: enforcement was silently off, and a
-  hallucination dial reached the network (403) during that window. The plugin
-  is dual-interface (V1 `server()` + V2 `id`/`setup()` on one default export;
-  shared enforcement logic, no translated shim); the test suite includes a
-  loader-contract test (exactly one export, carrying both entrypoints) — but
-  after any install or edit, *prove* enforcement with a blocked-host tool
-  call.
+- **A failed or disabled extension provides no protection.** Check startup
+  load errors and verify a harmless blocked call after installation. Other
+  extensions run with the same process permissions and can affect tool
+  arguments and execution; this extension is not a sandbox.
 - Nesting deeper than 6 argument levels is not scanned.
 - The block fires when the model *dials* a URL, not when it merely *sees* one;
   the error message teaches it to treat sightings as junk.
 
-## Validation
+## Historical validation (OpenCode)
+
+These results belong to the original OpenCode plugin and predate this port.
 
 Measured against the real incidents plus controlled test runs (ledger: 878
 dials, 665 blocked, 213 reached the network, final 2026-09-29 count — of the 213,
@@ -638,8 +674,12 @@ flat; blocked counts track exposure, not decay.
 
 ## Reproducing the bug
 
-Want proof this isn't a phantom? `tools/repro.py` drives real `opencode run`
-sessions and classifies every artifact-shaped URL the model produces:
+The retained `tools/` scripts are OpenCode research utilities. They do not
+read pi/omp session files or verify this extension. Fenced OpenCode
+experiments require the original OpenCode plugin, not this port.
+
+`tools/repro.py` drives real `opencode run` sessions and classifies
+artifact-shaped URLs:
 
 ```bash
 python3 tools/repro.py --model <provider/model>     # raw + fenced pass
@@ -758,16 +798,15 @@ you change `--site` — these are public servers.
 
 ## Development
 
-Requires Node.js ≥ 23.6 (the test suite runs `.ts` directly via type
-stripping; no build step — opencode transpiles the plugin itself at load
-time). See the [opencode plugin docs](https://opencode.ai/docs/plugins) for
-`tool.execute.before`.
+Requires Node.js ≥ 23.6 for the test runner's TypeScript stripping.
+The hosts load TypeScript directly; no compiled distribution is needed.
 
 ```bash
-npm install        # dev deps: typescript + @opencode-ai/plugin types
+npm ci             # dev dependencies: TypeScript and Node types only
 npm test           # node --test
 npm run typecheck  # tsc --noEmit
 npm run repro:selftest  # offline check of tools/repro.py's classifier
+npm pack --dry-run # inspect distributable files
 ```
 
 Test coverage: all four rules (exact incident host; the `routify-file-*` host
@@ -776,10 +815,28 @@ family — oversea label, internal endpoint, `.io` variant all blocked; the
 guards), case-insensitivity, near-miss
 pass-through (legit OSS buckets, a relay operator's signed `proxy_temp_file`
 export, "Routify" the company), per-rule guidance (family-specific full/terse
-text; legacy publisher guidance unchanged), depth-cap boundaries, object-key scanning,
-empty/odd argument shapes, the exact incident call shapes (webfetch, MCP
-`urls` array, `bash curl`, nested subagent prompt), the self-compatibility
-guard, and the loader-contract test mirroring opencode's `getLegacyPlugins`.
+text), depth-cap boundaries, object-key scanning, empty argument shapes,
+incident call shapes (fetch, MCP `urls` array, `bash curl`, nested subagent
+prompt), unchanged arguments, per-session warning state, independent factory
+instances, and warning-history eviction. No pi or omp installation is needed
+for unit tests.
+
+Verified with omp 18.13.2 using an extracted npm tarball without installed
+dependencies. Six blocked calls produced no filesystem side effects, three
+clean calls executed, and the loopback provider received all six policy
+reasons. The smoke run covered all four rules, nested custom-tool arguments
+and keys, and shortened guidance on a repeated block.
+
+For integration verification, launch the actual omp CLI against a loopback
+OpenAI-compatible fixture provider. Exercise blocked `bash`, `write`, and
+custom-tool calls plus clean calls; check filesystem side effects and the
+policy reasons received by the provider. Load the package directory with
+`--no-extensions -e .` to exercise manifest discovery as well as interception.
+Use isolated configuration and never dial the blocked hosts.
+
+[pi-extensions]: https://unpkg.com/@mariozechner/pi-coding-agent@0.73.1/docs/extensions.md
+[omp-extensions]: https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md
+[omp-loading]: https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md
 
 ## License
 

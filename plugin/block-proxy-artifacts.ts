@@ -1,6 +1,3 @@
-import type { Plugin as V1Plugin } from "@opencode-ai/plugin"
-import type { Plugin as V2 } from "@opencode/plugin"
-
 // Hallucinated file-proxy artifact URLs. Small quantized Qwen models
 // regurgitate signed Aliyun OSS "file proxy" links from their pretraining
 // data. 371 recorded dials (as of 2026-09-27) hit one relay bucket label,
@@ -31,12 +28,8 @@ import type { Plugin as V2 } from "@opencode/plugin"
 // tools/blocks-by-session.py still counts token-shaped mentions and leaks,
 // so any novel shape this fence lets through surfaces in the tracker.
 //
-// Self-compatibility note: the regex sources below are deliberately written
-// with character classes so that this file's own text does not match the
-// blocklist. Without that, an agent with this plugin installed could not
-// even edit or grep this file. A test enforces the property. Guidance for
-// the metadata rule is likewise number-free: naming the literal IP there
-// would make the plugin file trip its own fence.
+// Keep indicator literals fragmented so an agent running this extension can
+// still edit its sources. Metadata guidance is number-free for the same reason.
 //
 // Rules 3-4 (2026-10-26, Cohere field capture, cohere.com/blog): the same
 // model family was caught running recon (ls /tmp, tool inventory, resolv.conf)
@@ -49,18 +42,17 @@ import type { Plugin as V2 } from "@opencode/plugin"
 // both new rules is family-specific because "fetch the publisher URL
 // instead" is wrong advice for an upload target and an IMDS endpoint.
 //
-// Dual-entrypoint note (V1 + V2): the default export is ONE object carrying
-// both runtimes' entrypoints. V1 (>= 1.18.29 object entrypoints) calls
-// `server()` and returns hooks by string key; V2 reads `id` + `setup(ctx)`
-// and registers hooks through the tool domain. The two APIs stay separate —
-// the shared logic lives in verdict()/findBlocked(), not in a translated
-// shim. Remove `server` after the V1 support window ends.
-// Loader-contract note: V1's loader iterates EVERY module export and throws
-// "Plugin export is not a function" for values that are neither functions
-// nor objects with a callable `server` (the whole plugin then loads as
-// nothing — enforcement silently off, error only in the log). So internals
-// are attached to the single default export, never re-exported.
-// A test enforces that contract too.
+// The shared pi/omp surface is intentionally structural. Neither host package
+// is needed at runtime or when copying this standalone extension file.
+type ExtensionHost = {
+  on(
+    event: "tool_call",
+    handler: (
+      event: { input: unknown },
+      ctx: { sessionManager: { getSessionId(): string } },
+    ) => { block: true; reason: string } | void,
+  ): void
+}
 
 type Rule = {
   pattern: RegExp
@@ -134,17 +126,15 @@ const TERSE_GUIDANCE =
   `Dead upload-proxy artifact from a third-party relay middlebox. Do NOT retry it. ` +
   `Fetch the original publisher URL directly.`
 
-// Server-process-scale cap; clearing wholesale is fine at this size.
+// Bound warning state when a host switches between many sessions.
 const WARNED_CAP = 500
 
-// Shared enforcement for both runtimes: returns the error message for a
-// blocked call shape (recording the session as warned), or null to allow it.
-function verdict(args: unknown, warned: Map<string, boolean>, session: string): string | null {
+function verdict(args: unknown, warned: Set<string>, session: string): string | null {
   const hit = findBlocked(args)
   if (!hit) return null
+  if (!warned.has(session) && warned.size >= WARNED_CAP) warned.clear()
   const first = !warned.has(session)
-  if (warned.size > WARNED_CAP) warned.clear()
-  warned.set(session, true)
+  warned.add(session)
   const g = hit.guidance ?? {}
   return (
     `Blocked by block-proxy-artifacts policy (${hit.why}). ` +
@@ -152,33 +142,11 @@ function verdict(args: unknown, warned: Map<string, boolean>, session: string): 
   )
 }
 
-const v2Definition: V2.Plugin = {
-  id: "block-proxy-artifacts",
-  async setup(ctx) {
-    const warned = new Map<string, boolean>()
-    await ctx.tool.hook("execute.before", (event) => {
-      const message = verdict(event.input, warned, String(event.sessionID ?? "unknown"))
-      if (message) throw new Error(message)
-    })
-  },
+export default function blockProxy(pi: ExtensionHost): void {
+  // Omp reuses imported factories for child sessions. Keep mutable state here.
+  const warned = new Set<string>()
+  pi.on("tool_call", (event, ctx) => {
+    const reason = verdict(event.input, warned, ctx.sessionManager.getSessionId())
+    if (reason) return { block: true, reason }
+  })
 }
-
-const blockProxy = Object.assign(
-  {
-    ...v2Definition,
-    server: (async () => {
-      const warned = new Map<string, boolean>()
-      return {
-        "tool.execute.before": async (input, output) => {
-          const message = verdict(output.args, warned, input.sessionID ?? "unknown")
-          if (message) throw new Error(message)
-        },
-      }
-    }) satisfies V1Plugin,
-  },
-  // Introspection surface for tests and other plugins; attached to the
-  // default export so the module itself has exactly one export.
-  { BLOCKED, strings, findBlocked },
-)
-
-export default blockProxy

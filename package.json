@@ -1,10 +1,11 @@
 {
-  "name": "opencode-block-proxy-artifacts",
+  "name": "pi-qwen-block-proxy-artifacts",
   "version": "0.1.0",
-  "description": "opencode plugin that hard-blocks hallucinated/dead file-proxy artifact URLs (Qwen regurgitation) before any tool dials out",
+  "description": "Shared pi and omp extension blocking hallucinated file-proxy URLs, known upload targets, and cloud metadata endpoints before tool execution",
   "keywords": [
-    "opencode",
-    "opencode-plugin",
+    "pi-package",
+    "pi",
+    "omp",
     "hallucination",
     "ssrf",
     "privacy",
@@ -17,10 +18,13 @@
   "exports": {
     ".": "./plugin/block-proxy-artifacts.ts"
   },
+  "pi": {
+    "extensions": ["./plugin/block-proxy-artifacts.ts"]
+  },
   "files": [
     "plugin/block-proxy-artifacts.ts",
-    "tools/blocks-by-session.py",
-    "tools/repro.py",
+    "COHERE-2026-10-26.md",
+    "SURGERY.md",
     "README.md",
     "LICENSE"
   ],
@@ -30,12 +34,10 @@
     "repro:selftest": "python3 tools/repro.py --selftest"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.0.0",
-    "@opencode/plugin": "^2.0.22",
     "@types/node": "^26.6.2",
     "typescript": "^5.6.0"
   },
   "engines": {
-    "node": ">=23.6"
+    "node": ">=20.6"
   }
 }
