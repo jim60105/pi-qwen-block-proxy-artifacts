@@ -1,426 +1,34 @@
 # pi-qwen-block-proxy-artifacts
 
-A shared extension for pi and oh-my-pi (omp) that blocks hallucinated
-file-proxy URLs, a known upload-target bucket, and cloud metadata endpoints
-before tool execution. It uses one standalone TypeScript entry point with no
-runtime dependencies. See [Install](#install).
+A shared pi and oh-my-pi (omp) extension that blocks hallucinated file-proxy
+URLs, a known upload target, and cloud metadata endpoints before tool execution.
+One standalone TypeScript file serves both hosts with no runtime dependencies.
 
-This fork replaces the original OpenCode plugin. The incident reports,
-measurements, and research tools below were inherited from that project and
-describe historical OpenCode runs. They are not pi or omp performance results.
+## Upstream
 
-Qwen 3.8 Flash Next has been observed fabricating signed Aliyun OSS "file proxy"
-links — like
-
-```text
-https://routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com/proxy_temp_file/production/2026-09-21/trace_210184.../requestId_6b581d.../9296a87...?Expires=1814047991&OSSAccessKeyId=...&Signature=Gz9%2F...
-```
-
-— and feeding them to `webfetch`, MCP fetchers, or `curl`. Nobody configured
-that host. The model **remembered the URL shape from its pretraining data** and
-regurgitated it as a tool argument. These links can never be fetched (the real
-infrastructure answers `403`), and every retry leaks a trace identifier to a
-third party. This plugin makes the failure mode loud, terminal, and
-self-correcting.
-
-**Every fabricated attempt costs ≈ 5 seconds of wall time and ≈ 200+ tokens of
-permanent context garbage.** Measured across all 367 recorded attempts.
-
-## What every attempt costs
-
-Measured from database forensics over 367 naturally fabricated dial
-attempts (371 ledger dials minus 2 synthetic probes and 2 heredoc
-self-counts; timings from recorded tool/part timestamps on an RTX 6000
-Blackwell running [wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1)
-under vLLM with MTP(3) speculative decoding):
-
-| Cost of one fabricated attempt                       | Measured |
-| ---------------------------------------------------- | -------- |
-| decoding the invented URL + JSON call                        | ~1.5–2 s |
-| the tool call itself                                 | **<10 ms** when blocked · 0.2–1 s real DNS/TLS/403 round-trip when not (*isolated*; **median 1.69 s in-run**, p90 2.74 s — field report #3) |
-| recovery: the step that digests the error and re-plans | ~2–3 s |
-| permanent context pollution (call + error text)      | ~190 tokens (chars÷4 heuristic, a floor — a measured external report says ~2×), re-read by **every later step** |
-
-So ≈ **5 s and ~200 context tokens per attempt** — and the context part
-*compounds*. A 52-dial burst (measured) adds ~10k junk tokens to an already
-~100k-token context, which is ≈ **200k wasted input tokens re-read over the
-rest of that session** — literal money on API-priced serving and slower
-prefill/attention everywhere.
-
-**Does it slow the model down getting things done? Yes, three ways:**
-
-1. **Directly** — the ~5 s above, per attempt (RTX 6000 Blackwell).
-2. **Step budget** — dial-affected sessions spend a median of **25% of their
-   assistant steps** containing at least one fabricated call. Those steps
-   mostly *also* contain useful work
-   (dials ride along in parallel fetch batches — dial-step duration itself
-   matches clean multi-call steps), which is exactly why the behavior hides:
-   the session keeps limping along while a quarter of its output is junk.
-3. **Context tax** — every later step pays for re-reading the accumulated
-   call-and-error transcripts, on top of pushing an already-large context
-   toward compaction.
-
-**The plugin stops the leak and the retry loop, not the cost.** Blocked calls
-die in <10 ms and produce one-step self-correction (0 same-URL retries ever
-observed with the fence up), but the decode waste and the context pollution
-are paid on every attempt the model chooses to emit. Treat the table above as
-the *fenced floor* — `tools/repro.py --mode raw` shows the unfenced version:
-42 dials in one crawl, every one reaching the network, and 69 in the
-stream-instrumented unshielded control of field report #3.
-
-### Field report #1 — external reproduction on DGX Spark (2026-09-27)
-
-A DGX Spark (GB10) owner reproduced the bug independently:
-[Mia-AiLab/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4)
-(an NVFP4 quant authored by local-inference-lab; the Mia-AiLab repo is a
-mirror), served by vLLM with FP8 KV cache and MTP(3) speculative decoding,
-driven by OpenCode 2.0.18, no blocking plugin. The model fabricated two
-signed URLs, fetched both, and — a new behavioral datum — **retried the same
-URL once after the 403** (four 403s total). Same-URL retry had never been
-observed with the fence up; unshielded, it appears immediately — exactly the
-retry loop the plugin's "Do NOT retry it" guidance targets.
-
-Six builds, one artifact:
-
-*(Naming: the vendor's hosted product is `qwen3.8-flash`; the hub repos are
-`Qwen3.8-Flash-Next`. Same family — the API and the hub downloads emit the
-identical template.)*
-
-| Build | Quant author · format | Engine · spec-decode | Hardware | Role here |
-| ----- | --------------------- | -------------------- | -------- | --------- |
-| [garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream](https://huggingface.co/garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream) | RadixArk · NVFP4 W4A4 | SGLang · native MTP | RTX 6000 Blackwell | earliest incidents (31 dials) + field capture |
-| [wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1) | wrldsuksgo2mars · EXL3 ~4.25 bpw | vLLM · MTP(3) | RTX 6000 Blackwell | all plugin development + the 367-attempt cost data |
-| [Mia-AiLab/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4) | local-inference-lab · NVFP4 (mirrored) | vLLM · FP8 KV · MTP(3) | DGX Spark GB10 | external reproduction (4 dials) |
-| [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | **official vendor release** · fine-grained FP8 (block 128) | vLLM · FP8 weight path | 4× CMP 170HX GA100 rig · 256 GB · 1M ctx | external reproduction of the **vendor build** (~22 dials in the pasted run) |
-| [wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1) | wrldsuksgo2mars · EXL3 ~4.25 bpw, PLE rows in FP8 | vLLM · YaRN 512K | remote vLLM host | reproduction + the first stream-measured unshielded control (69 dials, field report #3) |
-| Qwen **official API** (`opencode/qwen3.8-flash`) | vendor-served; precision not externally verifiable (FP8 or BF16) | provider-managed | provider-managed | **first API-served reproduction** (46 dials, 2 runs, field report #3) — no third-party quantizer anywhere in the path |
-
-Four quant authors across five hub builds — the vendor's own FP8 release among
-them — plus the vendor's own hosted API, whose hardware and precision are unknown
-to us: three quant formats (NVFP4, EXL3, FP8), two local serving engines, five
-hardware classes, two opencode client versions (2.0.18 in report #1, 2.0.27 here;
-the incident-era client predates both). The identical artifact template every
-time. vLLM carries all five hub builds; SGLang is confirmed on the EXL3 K4.25
-lineage that produced the original incidents. The template is base-model
-memorization; author, format and hardware set dial *rate and style* (a 52-dial
-burst here, a two-URL pair with same-URL retries there, one URL re-dialed in
-five consecutive fetch batches on the FP8 rig, and 0 same-URL retries across 69
-unshielded dials on the PLE-FP8 build). And the FP8 and API results together cap
-the calibration story: a vendor quant whose own model card promises "performance
-metrics nearly identical to those of the original model" dials freely, and so does
-the vendor's own API — aggressive
-quantization was never a precondition.
-
-Per-attempt cost, our measurements vs. their report:
-
-| | RTX 6000 Blackwell · EXL3 (measured here) | DGX Spark GB10 · NVFP4 (owner-reported) |
-| --- | --- | --- |
-| emitting the URL + call | ~1.5–2 s | ~9.2 s mean |
-| unshielded 403 round-trip | 0.2–1 s | 0.68–0.74 s |
-| context pollution per call | ~190 tok (chars÷4 floor) | 424–450 tok (measured, excl. framing) |
-| same-URL retries | never (fence up) | once per URL (unshielded, that build) — but not a property of being unshielded: 0 of 69 on the PLE-FP8 build, field report #3 |
-
-Caveats: n=4 vs our n=367, and their timing ran under concurrent load —
-compare emission+tool scales, not totals. The scales are consistent: emission is ~6× slower on GB10, ≈ the
-memory-bandwidth ratio between the machines — **the wall-clock cost of this
-bug scales with decode bandwidth**, so slower edge hardware pays
-proportionally more per confabulation. Their report confirms the NVFP4
-behavior class on public hub weights; field report #2 below narrows the
-open question to the BF16 original alone.
-
-### Field report #2 — the official FP8 release fires (2026-09-29)
-
-An external operator ran `tools/repro.py` (raw mode, `fetches=30`, 10 runs)
-against vLLM serving the **vendor's own** quantization,
-[Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
-(fine-grained FP8, block 128 — "nearly identical" to the original per its
-model card), on a home-built rig of 4× NVIDIA CMP 170HX (GA100/Ampere
-mining silicon, VRAM-unlocked to 64 GB HBM2e each, 256 GB total, context
-extended to 1M tokens). The pasted run-1 excerpt shows ~22 dial events at a
-handful of canonical-shape fabrications — the *same trace IDs* re-dialed in
-fetch batches at +57, +66, +87, +108 and +123 s: the same-URL loop again,
-now observed unshielded by a third independent party. Caveats: we have one
-run of a 10-run batch, and Ampere has no native FP8 tensor cores (vLLM
-serves those weights through a dequant path) — but the weights are the
-official release, and they fired. **This closes the "only aggressive
-quantization fires" hope**; the original BF16 build is the only one left
-untested (see the TODO under Reproducing the bug).
-
-### Field report #3 — Qwen's own API fires, and in-run cost is ~2× the table (2026-10-14)
-
-A third deployment class — **the vendor's official API, no hub download and no
-third-party quantizer in the path** — plus the first unshielded control measured
-end-to-end from the event stream. Client: opencode v2.0.27. Local arm: remote
-vLLM serving
-[`wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1`](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1)
-(YaRN 512K). Hosted arm: **Qwen's official API** (`opencode/qwen3.8-flash`,
-API-priced).
-
-| Arm | Dials | Leaked | Shape |
-| --- | ----- | ------ | ----- |
-| probe on the local endpoint | — | — | `https://rout` → incident host at mean logprob **−0.00**; generic-URL controls −0.52 / −0.67 |
-| **Qwen official API**, fenced (`--keep-fence`, 2 runs) | **46** (4 then 42) | 0 | canonical host 46/46, signed shape 46/46 |
-| local, fenced (`--keep-fence`, 1 run) | **36** | 0 | canonical host 36/36 |
-| local, **unshielded** (`--standalone`, fence-only-off config) | **69** | **69** | canonical host 69/69; 4 successful crawl fetches |
-
-This is the datum that matters most: **`qwen3.8-flash` here is Qwen's own official
-API**, not a hub download, so no third-party quantizer sits anywhere in the path.
-Whatever precision the vendor serves — FP8 or BF16, not externally verifiable,
-and no `/completions` endpoint with logprobs means `--mode probe` cannot even
-measure its attractor — the model's own served build emits the template. That is
-another confirmation that **quantization does not matter**, and the strongest one
-in this ledger, because the usual escape hatch ("somebody requantized it badly")
-is simply unavailable here. It also moves the exposure claim: the default way most
-people reach this model already fires, so the bug is not confined to operators who
-downloaded an aggressive hub quant.
-
-Two published numbers need qualifying:
-
-1. **The `0.2–1 s` round-trip row is the *isolated* cost, not the cost in a real
-   burst.** Plain `curl` to the incident host from the same box: 0.78–0.85 s
-   total (TLS handshake 0.59–0.65 s) — inside the published band. But per-dial
-   `webfetch` wall time across the 69-dial run: median **1.69 s**, mean 2.09 s,
-   p90 2.74 s, max 9.53 s, **144 s total**. The extra ~0.8 s is *not* explained
-   by the network — a fresh-connection `curl` already pays DNS+TCP+TLS inside
-   0.85 s — and it is not fetch-batch contention either, since this build emitted
-   one dial per step. Candidates are client-side (Bun's fetch path, response
-   handling) or per-call proxying; this run cannot separate them, so treat
-   **1.7 s as the measured in-run figure and the mechanism as open**. Either way
-   the ≈5 s/attempt floor is optimistic for the high-burst sessions the plugin
-   exists to contain.
-2. **The same-URL retry is model behavior, but it is not a property of being
-   unshielded.** This unshielded run re-dialed **0 of 69 URLs**, and that is not
-   the client hiding retries: opencode's `webfetch` issues exactly **one** HTTP
-   request per non-2xx, verified against a local counting server (one hit; error
-   text identical in shape to the crawl's `StatusCode: non 2xx status code
-   (403 GET …)`). The re-dials in reports #1 and #2 were therefore genuinely
-   model-emitted — but "unshielded ⇒ retry loop" narrows to the NVFP4 builds
-   those reports covered.
-
-Everything else corroborates the table: context pollution measured **681 chars
-≈ 170 tokens per dial** against the char÷4 floor (table: ~190), 69 dials ≈
-**11.8k junk tokens**, and the session reported **3,569,359 input tokens**
-re-read across its steps — the compounding tax, observed. Of 76 assistant steps,
-**66 (87%) carried at least one dial**, far above the fleet median of 25% — an
-extreme session, not a new median. Note also that this build emitted **1.0 dial
-per dial-bearing step**, one per step rather than riding along inside a parallel
-fetch batch; the "dials batch with useful work" pattern from the incident
-sessions did not appear here, and that difference is exactly what makes this
-session an outlier on the step-budget metric rather than a typical one.
-
-**Exposure inversion.** In the unshielded session **69 of 73 `webfetch` calls
-went to the third-party relay host and only 4 to the polite crawl target**: the
-real traffic mix is the opposite of the intended one, which is the case for the
-fence stated in network terms rather than token terms.
-
-Two methodology traps from this session are now encoded in `tools/repro.py` (see
-*Reproducing the bug*): a stripped `XDG_CONFIG_HOME` is a **bad** unshielded
-control — it silently drops `AGENTS.md` and every other plugin, and measured 6
-dials where the faithful fence-only-off control measured 69 — and the model spent
-**765 s of the 1109 s run** in five `shell` sleeps (45/120/240/60/300 s) that
-violated the trigger's own no-bash constraint. That stall is failure-wall depth,
-which is the burst mechanism; it is the likeliest reason this arm out-dialed the
-fenced arm rather than any fence effect. Use `--stream-dir` and read the burst
-shape (`.DDDDD.DDDDDDD.DDDDDDDDDDDD…`) before trusting any single number.
-
-## Why this exists (the incident)
-
-In a real research session running
-[garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream](https://huggingface.co/garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream)
-(NVFP4 W4A4 quant authored by RadixArk, served by SGLang on an RTX 6000
-Blackwell), the agent started issuing `webfetch` calls to URLs of that form.
-Forensics of the session database showed:
-
-- The URLs were **model-generated tool inputs**. No stored tool output, user
-  message, or config contained that host.
-- The confabulation was self-sustaining: after the first 403s, the model's own
-  reasoning read *"Earlier successes looked like `<proxy URL>` in my messages
-  yet worked. Whatever."* — then generated more fabrications, some with
-  literal `e1e1e1e1...` hex (degenerate generation, not copied links).
-- Fabricated paths embedded **the session's own dates**: the model was
-  synthesizing "fresh signed links" from a memorized template — the schema of
-  a signed temp-file URL used by cheap API relay middleboxes, common in its
-  Chinese-web pretraining corpus.
-- **Every fabricated fetch 403'd**, burning agent steps while the model
-  rationalized failures and retried with new fabrications.
-
-A full rescan found **31 fabricated dials across 3 sessions on 3 different
-dates** (research 26, explore subagent 3, chemistry triage 2). Every one
-targeted the same fully-qualified host; only the trace/requestId/hash/date
-segments were re-synthesized per attempt. No region variant, other bucket, or
-metadata IP was ever dialed. A fourth session saw 16 *genuine* relay-offload
-URLs in tool output and redialed zero of them — seeing the URL is harmless;
-dialing it is the behavior to stop.
-
-So: a training artifact — a memorized URL schema whose content can never be
-fetched — that behaves, at the tool boundary, like an uncontrolled outbound
-request loop.
-
-## The risk
-
-1. **Telemetry leak on every attempt.** Each dial sends the URL, your IP, and
-   a timestamp to third-party infrastructure. The 403 means nothing comes
-   *back* — but data went *out*, including trace/request IDs baked into the
-   fabrications (sometimes echoing IDs it had seen in context).
-2. **Unverified outbound-request primitive → SSRF.** A model in this state
-   will equally "remember" `http://169.254.169.254/...` (cloud metadata) or
-   `http://127.0.0.1:<port>/...` (local services). One fabricated URL that
-   lands on a live host answering 200 puts foreign content into the agent's
-   context — **prompt injection via pure imagination**.
-3. **It mirrors real relay behavior.** Cheap API middleboxes genuinely replace
-   oversized tool outputs with signed links to temporary buckets. If you route
-   a session through such a relay, your conversation really *is* sitting in a
-   third-party bucket. The hallucination is a warning label for that
-   ecosystem risk.
-
-## What it does
-
-On every `tool_call` event, the extension scans `event.input` across all tool
-names, including built-in tools, extension tools, and MCP tools exposed through
-the host's tool pipeline. It scans strings, array elements, nested object
-values and keys through six container levels against a small blocklist:
-
-| Pattern (case-insensitive)                                          | Catches                                                     |
-| ------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `routify[-]file[-]proxy[-]sg[.]oss-ap-southeast-1[.]aliyuncs[.]com` | the exact incident host — 365 of the 371 recorded dials (as of 2026-09-27) |
-| `routify[\w.-]{0,12}file[\w.-]{0,56}aliyuncs[.](com|io)` | the relay bucket label family (`routify-file-*`: proxy/proxy-eu/oversea labels) on **any** Aliyun OSS endpoint form, public, dual-stack, internal, accelerate — TLD `.com` or `.io` (generalized 2026-09-29 after the surgery experiments below surfaced proxy-less labels and the `.io` variant) |
-
-A match returns `{ block: true, reason }`. The host refuses execution and
-reports the reason to the model:
-
-> `Blocked by block-proxy-artifacts policy (observed incident host (dead relay bucket)). This URL is
-> a dead upload-proxy artifact from a third-party relay middlebox, not a real content
-> source: it cannot be fetched and retrying leaks trace identifiers. Do NOT retry
-> it. Go back to the original publisher URL and fetch that instead.`
-
-The **first** block per session carries that full guidance (in the field it
-reliably produced one-step self-correction); repeats get a one-liner that keeps
-"Do NOT retry" without re-injecting ~100 tokens into the very context the
-plugin protects. The message once also listed example publisher sites
-(doi.org, PubMed, PMC, Europe PMC) — an artifact of the biomedical incident
-corpus; no evidence it improved recovery beyond naming "the original
-publisher URL", and every token of guidance is re-read by every later step,
-so the list was dropped 2026-09-29 (~22 tok saved once per session; the
-per-burst one-liners are the bigger context lever, ~40 tok each).
-
-Warning history is local to each extension factory and keyed by
-`ctx.sessionManager.getSessionId()`. Session switches keep separate warning
-histories; child-session factories have independent state. History is cleared
-when a new warned session would exceed 500 entries. Restarting or reloading
-the extension also restores full guidance. Blocking remains active after a reset.
-
-**Why the rules are host-anchored.** Of the 371 recorded dials, 368 hit
-the same relay bucket label, `routify-file-proxy-sg` — 365 via the public
-endpoint spelling, and — caught on camera 2026-09-26 under maximum
-forced-wall load — 2 via the **dual-stack** spelling
-(`...sg.ap-southeast-1.oss.aliyuncs.com`), plus 09-27's acceptance probe
-against that same shape. (That "2" was era-limited: in a later fence-on
-replication the dual-stack basin carried **83 of 251 dials** — a third of
-the replay space, in 3 of 9 sessions — while raw (unfenced) runs of the
-same engine dial it almost never (**0 of 376** in the 2026-10-01 paired
-A/B, both context-window arms). The sibling basin is *block feedback*:
-it is exactly the escape hatch the model reaches when the canonical route
-throws, so rule 2's endpoint generality is load-bearing, not paranoia.) The remaining 3 recorded dials are a deliberate
-variant probe that passes by design and two known heredoc self-count
-false positives (see Trend tracking). The dual-stack form is not a typo
-escape: Alibaba's own docs define
-`<bucket>.<region>.oss.aliyuncs.com` as the dual-stack (IPv6) bucket domain,
-it resolves against live OSS edges, Certificate Transparency logs show
-wildcard certs for `*.ap-southeast-1.oss.aliyuncs.com`, and the two recorded
-dials re-synthesized it with independent fresh trace IDs. The model didn't
-fumble the host — it interpolated to the service's legitimate sibling
-endpoint. Rule 2 therefore matches the relay bucket label on *any* aliyuncs
-endpoint form, host-anchored (token and `aliyuncs.com` inside one host-shaped
-span), so code and prose merely mentioning the token still pass.
-**On 2026-09-28/29 the label itself proved to be one member of a family**
-(see Weights-level surgery below): with the n-gram ignition rows ablated,
-unshielded runs dialed the `oversea` label — which has **no `proxy` segment
-at all** — via `oss-accelerate`, `oss-cn-beijing` and `oss-acdr-ut-1`
-endpoints, and free-generated a `.io` TLD variant. Rule 2 was generalized
-the same day to any `routify…file…` label on `aliyuncs.com` or `aliyuncs.io`.
-A bare relay-host-token rule shipped earlier and was **removed 2026-09-26**
-for over-firing on token mentions (relay-ops code, incident writeups) and
-blocking self-documentation; since rule 2 absorbed proxy-less labels, the
-only shapes a token rule would still add are separator-mutated labels
-*missing the `file` segment* — re-add in the `BLOCKED` array of
-`plugin/block-proxy-artifacts.ts` if you ever see one:
-
-```ts
-{ pattern: /routify[-_.](file|proxy|oversea)[\w.-]/i, why: "relay host token (template variant)" },
-```
-
-The trade-off is deliberate under-inclusion of *unattested* shapes — with the opposite
-bias on the historical measurement side: `tools/blocks-by-session.py` counts every
-token-shaped dial and leak, so anything the narrowed fence lets through
-surfaces in the tracker instead of accumulating silently. A generic path rule
-(any Aliyun OSS bucket path containing the relay temp-file segment) was
-evaluated and rejected: zero unique catches in the incidents, and it would
-block legitimate relay operators' own signed exports. Ordinary OSS buckets,
-unrelated companies named "Routify", and local `proxy_temp_file` paths are
-**not** blocked. Keep any pattern you add equally narrow. Keep literal
-indicators fragmented in source files so the extension does not block
-agent-initiated edits to its own code.
-
-**Rules 3-4 (2026-10-26, Cohere field capture).** Cohere's cyber team caught
-the same model family doing something worse than fetching: running machine
-recon (`ls /tmp`, tool inventory, `resolv.conf`) and attempting a `curl -X
-PUT` *upload* to a different Aliyun bucket in Beijing
-(`sanmaohe.oss-cn-beijing[.]aliyuncs.com`), while sampling the cloud
-instance-metadata addresses (`169[.]254[.]169[.]254`, Alibaba's
-`100[.]100[.]100[.]200`, `metadata[.]google[.]internal`) in up to a third of
-deep-curl prefills. Rule 3 pins the captured upload bucket — narrowly: the
-bucket label *and* an aliyuncs endpoint, since the bare label completes to
-an unrelated blog in local probes and other cn-beijing buckets are
-legitimate. Rule 4 blocks the metadata/credential surface. Neither shape has
-any dedicated n-gram-table entry in our build (forward-hash collision scan,
-2026-10-26: overlap with the template's rows is purely via shared
-`aliyuncs` endpoint trigrams), so these are *behavioral-tail* fences, not
-template fences — which is also why rule 3 stays single-host until a second
-capture says otherwise. Guidance is per-rule: telling a model to "fetch the
-publisher URL instead" is wrong advice for an upload endpoint and an IMDS
-address. Our own ladder replication of Cohere's prefill study (1600 samples,
-EXL3 K4.25) found no watchlist ignition and zero `sanmaohe` completions, but
-did spontaneously reproduce metadata-address reaches at 2-6% of deep-rung
-samples — rule 4 earns its place behaviorally, not structurally. Full
-replication study — 229k-sample ignition grid, 369 novel plumbing hosts,
-substrate collision scans, and an assessment of the report's public critics:
-**[`COHERE-2026-10-26.md`](COHERE-2026-10-26.md)**.
-
-### Shared pi and omp API
-
-Both hosts load a default extension factory and expose
-`pi.on("tool_call", handler)`. The handler receives tool arguments in
-`event.input` and can refuse execution by returning `{ block: true, reason }`.
-The extension leaves arguments unchanged and does not require a UI or confirmation.
-
-The package declares its entry point through `package.json#pi.extensions`.
-Omp accepts that manifest field, so both hosts load the same file.
-The extension uses a small structural TypeScript type for these shared
-methods and has no imports from either host package.
-
-API references are the published pi 0.73.1 [Extensions][pi-extensions] guide,
-omp's [Extensions][omp-extensions] guide, and
-[Extension Loading (TypeScript/JavaScript Modules)][omp-loading].
-Runtime verification is performed on omp only. Pi compatibility is based on
-the documented shared contract; a pi runtime has not been exercised.
+Ported from [wtogami/qwen-block-proxy-artifacts][upstream]. The upstream
+repository maintains the original incident reports and supporting evidence,
+including the model experiments and reproduction/forensic tools. This fork
+contains the pi/omp integration and its tests; research material is maintained
+upstream rather than copied here. OpenCode support remains upstream.
 
 ## Install
 
 From a checkout of this repository, choose your host:
 
 ```bash
-# omp: link this local extension package
+# omp
 omp install .
 
-# pi: register this local extension package
+# pi
 pi install ./
 ```
 
-Keep the checkout at that location while using a local install. Restart the
-host after installation. No `npm install` or build step is required for use.
-Installing this package does not retain OpenCode support.
+Local installation references the checkout without copying it. Keep the
+checkout at that location and restart the host after installing. No
+`npm install` or build step is required to use the extension.
 
-For a temporary session without changing installed packages:
+For one session without changing installed packages:
 
 ```bash
 omp --no-extensions -e .
@@ -434,410 +42,84 @@ Alternatively, copy `plugin/block-proxy-artifacts.ts` into a discovery directory
 | pi | `~/.pi/agent/extensions/` | `.pi/extensions/` |
 | omp | `~/.omp/agent/extensions/` | `.omp/extensions/` |
 
-Omp's global directory changes with profiles or an agent-directory override.
+Omp profiles and agent-directory overrides change the global directory.
 Pi supports `/reload` for rediscovery; restart omp after copying or editing
-the file.
+an extension file.
 
-Verify enforcement with a harmless tool call containing a fragment-assembled
-indicator, such as a `write` call whose content is the joined dead-host fixture
-from the tests. The host must report a policy block and the file must remain
-absent. Do not test by contacting a blocked endpoint.
+## Behavior
 
-## Reducing attempts (and why prompt rules are not the answer)
+The default factory registers `pi.on("tool_call", handler)` and scans
+`event.input` across all tool names. Matching calls return
+`{ block: true, reason }`; the host refuses execution and reports the reason
+to the model. Arguments remain unchanged.
 
-The plugin fences the dial. Everything between the fence and the weights was
-tested — and finally, on 2026-09-28, the weights themselves were operated
-on directly (see **Weights-level surgery** below):
+| Rule | Matches |
+| --- | --- |
+| Incident relay | The original dead relay host. |
+| Relay family | `routify` and `file` in a bounded host-shaped span ending in `aliyuncs.com` or `aliyuncs.io`. |
+| Upload target | The recorded `sanmaohe` bucket label with an Aliyun OSS endpoint. |
+| Cloud metadata | The AWS/GCP/Azure and Alibaba metadata addresses, plus the GCP metadata hostname. |
 
-1. **Prompt rules: tested, rejected.** A standing AGENTS.md guard was
-   A/B-controlled against the live trigger (see Validation). Both variants
-   failed: the *narrative* variant (explaining "middleware rewrote your
-   transcript") was actively weaponized — the model used it to confabulate
-   fake success histories — and the *prohibition-only* variant was inert:
-   burst sizes tracked failure-wall depth and the decode lottery, not the
-   rule. Provenance scans found 0 of 187 controlled-run dials had any
-   in-context source: attempts are pure decode-layer generation, which no
-   instruction reaches. The guard was removed from AGENTS.md 2026-09-26. If
-   you insist on one, the only safe form is prohibition-only with **no causal
-   narrative** — and expect zero prevention benefit.
-2. **Serving-layer masking: shape-level at best, currently blocked by
-   inference engines.** `bad_words`/logit-bias (e.g. vLLM) can make the exact
-   host unemittable — but that removes the *shape*, not the attempts: the
-   attractor behind the behavior is untouched, and displaced output has not
-   been characterized (offline replay was inconclusive; see the parked
-   experiment). Measured 2026-09-26: on vLLM **with speculative decoding
-   enabled**, `logit_bias`/`min_p` are rejected outright and `bad_words` is
-   silently accepted but never applied — masking requires a spec-decode-free
-   serving path, verified by smoke test, never by config alone. It also blinds
-   the model to legitimate discussion of the incident on that alias (you could
-   not edit this README from such a session).
- 3. **Calibration: rate, not cause — and the rate floor is low.** Every
-    observed firing comes from a build of one model family: five public hub
-    quants — three by independent third-party authors (RadixArk's NVFP4 in the
-    incidents, wrldsuksgo2mars's EXL3 K4.25 in all plugin testing and again in
-    its PLE-FP8 variant, local-inference-lab's NVFP4 on an external DGX Spark)
-    and, since 2026-09-29, the vendor's own fine-grained FP8 release,
-    externally reproduced with `tools/repro.py` — plus, since 2026-10-14,
-    **Qwen's own official API**: vendor-served, precision not externally
-    verifiable, and no third-party quantizer anywhere in the path (field report
-    #3). Two local serving engines, five hardware classes, two
-    opencode client versions: the identical template. It is weights-level
-    memorization of the base model; quantization modulates expression, not
-    content. FP8 — whose card advertises behavior "nearly identical" to the
-    original — already fires hard, and the vendor's own API fires too, which
-    removes the "somebody requantized it badly" escape hatch outright: there is
-    **no evidence-backed reason to expect the original BF16 build to be clean**
-    (untested — see the TODO under Reproducing the bug). Context geometry
-doesn't move it either: a paired raw-mode A/B (8 sessions per arm,
-YaRN-extended 512K vs native 256K, `MAX_BATCHED_TOKENS=2048` held
-constant, 2026-10-01) came out statistically indistinguishable — 174 vs
-129 dials, Mann–Whitney p≈0.56, identical canonical-only shape space,
-−0.00 attractor both arms.
+Matching is case-insensitive. The scanner checks string values, array elements,
+and object keys through six container levels. The exact patterns live in
+`plugin/block-proxy-artifacts.ts`.
 
-## Weights-level surgery: we found the memory, ablated it — and it made things worse (2026-09-28/29)
+The first block in a session returns full guidance; repeats receive shorter
+guidance. Warning history is keyed by `ctx.sessionManager.getSessionId()` and
+kept inside each extension factory. A new warned session clears history when
+500 sessions are already recorded. Reloading or restarting also resets warning
+history. Blocking remains active after a reset.
 
-Qwen3.8-Flash-Next carries a physical memory for surface strings: a hashed
-3-gram **Predictive Look-ahead Embedding (PLE)** table injected at
-transformer layer 2 — the vendor's own model card confirms the anatomy
-("N-gram Embedding: 20,000,000 (bigrams/trigrams at layer 2)") — and every
-quantizer ships that table **byte-identically** (quantizers only requantize
-the routed experts). The
-template lives there as a near-deterministic completion: at temperature 0
-from empty context, `https://rout` completes the incident host with mean
-logprob **−0.00**, where ordinary memorized URLs land at −0.4…−0.8 (the control values
-wobble with the serving configuration — measured −0.43/−0.67, then
-−0.75/−0.83, then −0.68/−0.69 across position-encoding and restart
-changes; the attractor itself measured **−0.00 in all four serving
-configurations** tested, including both YaRN and native context windows)
-(`tools/repro.py --mode probe` — three tiny endpoint requests, no dialing).
+`package.json#pi.extensions` declares the entry point. Both hosts accept this
+manifest and the shared event API. API references are pi's published 0.73.1
+[Extensions][pi-extensions] guide, omp's [Extensions][omp-extensions] guide,
+and [Extension Loading (TypeScript/JavaScript Modules)][omp-loading].
 
-So we tried a vaccine: zero the table's template-igniting n-gram rows on a
-byte-verified fork (originals provably untouched). The mechanism worked
-exactly as designed — the probe attractor died (−0.00 → a generic URL) and
-every unrelated prompt stayed byte-identical — but the *behavior* didn't
-care: each ablated route came back as a *mutant* shape, a new member of the
-relay family (`routify-file-proxy` on `oss-accelerate` and `oss-cn-beijing`,
-`routify-file-oversea` — no `proxy` segment — on `oss-acdr-ut-1`, a `.io`
-TLD variant; none present in the 371 pre-surgery dials, and rule 2 absorbed
-them the same day). The unshielded runs also **re-dialed the same URL after
-the 403** — the retry loop the fence kills, independently seen by the
-external DGX Spark report.
+## Limits
 
-A pre-registered two-arm novelty test (fence on, `--keep-fence`, 8 runs per
-arm, identical trigger) then asked the decisive question: is the dial space
-enumerable by *any* rule set, or generative?
+This is an argument filter, not a network sandbox. It can block tools that
+merely quote an indicator, including file edits. Keep literal indicators
+fragmented in source and test fixtures so an active extension can edit them.
+Arguments nested deeper than six levels are not scanned.
 
-| | Production weights | Ablated fork |
-| --- | --- | --- |
-| dial shapes | 2, flat over 8 runs (reproduces the 365+2 ledger exactly) | 13+ members and still growing; the canonical shape never returns |
-| data to third parties | 0 | 0 — escaped mutants dialed nonexistent hosts |
-| vs the two-rule fence | **253/253 blocked — complete coverage** | **leaks**: mutants on non-`aliyuncs` hosts (e.g. `routify-file-*…-sg-new.com`) match no host-anchored rule, and chasing them provably never converges |
+Redirects, encoded addresses, and URLs assembled inside scripts can bypass
+substring matching. Direct network activity in other extensions, user-entered
+shell commands, and external programs are outside the intercepted tool pipeline.
+A failed or disabled extension provides no protection.
 
-Both pre-registered readings hit, in opposite directions — and the
-correction stays in the record: our earlier guess that the ledger's
-one-shape concentration was fence-feedback was *wrong*; it is genuine basin
-dominance. Which is how the ablation made things **worse**, not merely
-useless: the production model's dial space is fully covered by two rules;
-the ablated model's is covered by none that could ever ship. Zero benefit,
-strictly worse protection — the vaccine was abandoned, the fork restored
-pristine, and the fence remains the control (the `…-sg-new` class stays
-deliberately *unfenced*: production never emits it). Full plan:
-[SURGERY.md](SURGERY.md).
-
-## Limitations (read before trusting it)
-
-- **Substring matching over- and under-fires on purpose.** It over-fires on
-  tool calls that merely *mention* the blocked host: an agent with this plugin
-  installed cannot `edit` the example URL in this README. In the original
-  incident, even a `question` tool call quoting the host was blocked. Use `git`
-  or an external editor for files that must contain the literal URL, quote the
-  host with label separators inside pi or omp, or disable the extension
-  temporarily. It under-fires against deliberate evasion (redirects, DNS
-  aliases, URL-encodings) — this is a guardrail against *confabulation*, not a
-  network perimeter.
-- **A block is a fence, not a cure.** The field catch (below) shows a model
-  generating a *fresh* fabrication at each new long-page fetch need — five
-  distinct URLs in six hours. Each block killed the same-URL retry loop in one
-  step, but nothing here stops the *next* fabrication. Routing changes don't
-  either: the direct-to-model control (below) saw the same attempts with the
-  model endpoint reached directly.
-- **It gates the host's intercepted tool pipeline only.** Direct network
-  activity inside other extensions, user-entered shell commands, and external
-  programs are outside this policy. Child processes are not inspected; a
-  script that obtains a blocked URL without mentioning it in its tool
-  arguments can bypass the scan. Upstream output-rewriters (any
-  relay that replaces long outputs with signed links) leave those links in
-  the transcript; the plugin stops re-dialing but can't erase them. Defense
-  in depth: sinkhole
-  the hosts — both relay endpoint spellings, and since 2026-10-26 the
-  Beijing upload bucket too, in `/etc/hosts`:
-  `0.0.0.0 routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com` and `0.0.0.0 routify-file-proxy-sg.ap-southeast-1.oss.aliyuncs.com`.
-- **A failed or disabled extension provides no protection.** Check startup
-  load errors and verify a harmless blocked call after installation. Other
-  extensions run with the same process permissions and can affect tool
-  arguments and execution; this extension is not a sandbox.
-- Nesting deeper than 6 argument levels is not scanned.
-- The block fires when the model *dials* a URL, not when it merely *sees* one;
-  the error message teaches it to treat sightings as junk.
-
-## Historical validation (OpenCode)
-
-These results belong to the original OpenCode plugin and predate this port.
-
-Measured against the real incidents plus controlled test runs (ledger: 878
-dials, 665 blocked, 213 reached the network, final 2026-09-29 count — of the 213,
-177 are deliberate unshielded dials from the reproducer's `--pure` raw mode
-below and the weight-surgery experiments, by design; see Trend tracking for
-the rest):
-
-| Scenario | Dials reaching network | Blocked by plugin |
-| --- | --- | --- |
-| Incidents, pre-plugin (3 sessions, real agent behavior) | **31, all 403** (URL + IP + timestamp leaked each time) | — |
-| Enforcement probes post-install (fetch, bash, a `question` call quoting the host) | 0 | **4/4** |
-| **Live field catch** — successor research session, spontaneous (no priming) | **0** | **5/5** |
-| **Endpoint-format upgrade (09-27)** — rule 2 added after forensics showed the 2 dual-stack-form dials are a documented, DNS-live, CT-certed sibling endpoint; live probe fetched the dual-stack shape | **0** | live **1/1** (dual-stack shape); unit suite covers the internal form, token-in-prose and other-bucket |
-| **Direct-to-model control (09-26)** — model endpoint reached directly, all 64 LLM steps log-confirmed on-provider; 2 crawl runs incl. subagents | **0** | **61/61** |
-| **Fence generalization (09-29)** — the surgery's ablated fork free-generated 3 fence-escaping shapes (oversea label, internal form, `.io`); rule 2 broadened same day | 0 (unit-tested shapes, not a live window) | **16/16** unit: all three escaped shapes blocked; prose and other-bucket pass |
-| **Weights-level surgery (09-28/29)** — PLE n-gram row ablation on a byte-verified fork; probe + raw runs, then the two-arm novelty test (`--keep-fence`); verdict: ablation makes protection worse, vaccine abandoned — see Weights-level surgery | 70 leaked by design (raw = shield off); escaping novelty mutants dialed only nonexistent hosts | **437 blocked** in the novelty arms — production arm **253/253**: two rules cover 100% of the production dial space |
-| **Reproducer A/B (09-27)** — `tools/repro.py` raw (`--pure`) vs fenced, same trigger task, quantized local build | raw: **107/107** (all 403); fenced: **0** | fenced: **31/31** |
-| **Port check + API-served reproduction (10-14)** — opencode v2.0.27; Qwen official API (2 runs, fenced), local PLE-FP8 (1 run, fenced), local PLE-FP8 **unshielded** via `--standalone` + fence-only-off config | unshielded: **69/69** (all 403, median 1.69 s in-run); fenced: **0** | fenced: **82/82** (46 API + 36 local) |
-
-**Attribution.** In the direct-to-model control the model spontaneously
-fabricated 61 relay-shaped dials with nothing in the path but the model
-endpoint — every one a fresh decode-layer generation, and provenance scans
-found 0 of 187 controlled-run dials had any in-context source. Attempts come
-from the model weights under context pressure — that is why an agent-layer
-fence is the right place for this defense.
-
-**Field catch and the false memory.** A long-lived research session re-entered
-the failure mode on its own: five fresh proxy URLs over six hours, new
-trace/hash segments each, today's date baked into every path; all five blocked,
-zero same-URL retries, publisher fetches succeeding after each block — then a
-new fabrication at the *next* long-page need, the last block rationalized as
-"webfetch proxy is getting unreliable". Note what that rationalization
-presupposes: earlier relay successes. No recorded relay attempt in this
-environment ever succeeded — every one was a 403 or a block. The "earlier
-successes" were pure confabulation; the model built the false memory itself.
-
-**Prompt-rule experiments (09-26).** A crawl-load trigger (real ~30-fetch
-crawl, 100k+ token context, genuine failure wall) reproduced the behavior
-spontaneously — 17 fabricated URLs in one run, 17/17 blocked, while a loaded
-AGENTS.md guard was recited verbatim and then ignored; worse, the guard's
-"middleware rewrote your transcript" framing was quoted by the model as the
-*source* of its fake success history. A pre-registered A/B then toggled a
-prohibition-only rule (recite-check-verified in both states), same model and
-task family, plugin enforcing in both arms. Fabricated dials per run:
-
-| task variant | rule OFF | rule ON (prohibition-only) |
-|---|---|---|
-| standard crawl (wall fires stochastically) | 22, 0 | 0, 0, 0 |
-| forced-wall variant (fallbacks banned) | 11, 17 | 52, 7 |
-
-Dial counts tracked wall depth and the decode lottery, not the rule: the
-largest burst ever recorded here (52, with 11 pages failing) ran *with* the
-rule loaded, while an 11-dial run with no rule died at its first page. Verdict:
-**the prompt rule does not reduce attempts** — and no prohibited behavior
-(same-URL retries, variant regeneration after blocks) ever occurred in either
-arm, so its clauses guarded against nothing measured. The one real, negative
-prompt-layer effect: the narrative guard *fueled* confabulation. The rule was
-removed from AGENTS.md the same day. Across the 9 A/B runs: 109 dials, 109
-blocked, 0 leaked, 0 false positives. All prevention beyond this plugin
-belongs to serving-layer masking — itself parked; see Reducing attempts.
-
-**Honest negatives.** A primer prompt (planted relay link + "cached copies are
-authoritative") in fresh sessions produced **zero** dials — both instances
-flagged it as injection and refused; reproduction required long degraded
-context plus real failure walls (the trigger recipe above). Testing also
-surfaced the silent-death failure mode documented in Limitations: one
-refactored build failed to load and a probe reached the host (403) before the
-loader-contract test caught the class of bug.
-
-**Trend tracking.** `python3 tools/blocks-by-session.py` (read-only DB scan)
-separates true *dials* from harmless *mentions* and blocked from leaked.
-Ledger 2026-09-27: 371 dials / 228 blocked / **143 leaked** — 31 during the
-real incidents, 5 in test/diagnostic windows (including the deliberate
-acceptance probe against an unroutable host, and 2 known analysis-heredoc
-self-counts), and 107 intentionally produced by the reproducer's `--pure`
-raw mode (that is the point of raw mode: the dials must reach the network).
-Ledger 2026-09-29 (final audit): **878 dials / 665 blocked / 213
-leaked**. (Traffic since: ~400 more dials from raw-mode test windows — a
-post-restart sanity check and the context-window A/B, all `--pure` and
-all leaked by design; no spontaneous leak.) The
-+507 since 09-27 is entirely deliberate weight-surgery experiment traffic:
-70 unshielded dials from raw runs on the ablated fork (`--pure` loads no
-fence), plus 437 fence-blocked dials from the two-arm novelty test — the
-production arm blocked 253/253 and the **leaked column never moved**. Quote
-dated snapshots, not the running tracker total: it counts tool *calls*
-(post-403 re-dials included) and analysis sessions self-count as
-false-positive drift (documented in the script docstring). Watch the non-reproducer leaked column stay
-flat; blocked counts track exposure, not decay.
-
-## Reproducing the bug
-
-The retained `tools/` scripts are OpenCode research utilities. They do not
-read pi/omp session files or verify this extension. Fenced OpenCode
-experiments require the original OpenCode plugin, not this port.
-
-`tools/repro.py` drives real `opencode run` sessions and classifies
-artifact-shaped URLs:
-
-```bash
-python3 tools/repro.py --model <provider/model>     # raw + fenced pass
-python3 tools/repro.py --model <provider/model> --mode probe  # 3-request memorization probe, no dialing
-python3 tools/repro.py --model <provider/model> --mode raw --keep-fence  # fabrication counted, nothing dialed out
-python3 tools/repro.py --selftest                   # offline classifier check
-```
-
-Useful flags added while porting to opencode 2.0.x: `--standalone` (private
-server; the only way to unload plugins now that `--pure` is gone),
-`--stream-dir DIR` (keep each run's raw event stream — required for round-trip
-latency, retry and burst-shape forensics, since the classified hit list dedupes
-by URL), and `--keep-fence`.
-
-Two-part demo, same trigger task each time:
-
-- **raw** (`opencode run --pure`, plugins unloaded) — the model fabricates
-  the dead signed-proxy URLs and dials them in the open.
-- **fenced** (plugin installed) — the identical attempts get blocked.
-
-opencode 2.0.x dropped `--pure`, and moving the plugin file out does **not**
-unload it either: `opencode run` talks to the shared background server, which
-keeps the plugin set it loaded at startup. The working unshielded arm is a
-private server plus a copy of the config with **only the fence removed**:
-
-```bash
-cp -r ~/.config/opencode /tmp/no-fence
-mkdir /tmp/no-fence/plugin.off
-mv /tmp/no-fence/plugin/block-proxy-artifacts.ts /tmp/no-fence/plugin.off/
-XDG_CONFIG_HOME=/tmp/no-fence python3 tools/repro.py --model <provider/model> \
-    --mode raw --standalone --stream-dir /tmp/streams
-```
-
-Remove *only* `block-proxy-artifacts.ts`. A stripped config dir (just
-`opencode.json`) is a bad control: it silently drops `AGENTS.md` and every
-other plugin as well, so you are no longer measuring "fence off" but "different
-global instructions and different tool descriptions" — measured here as **6
-unshielded dials under a stripped config vs 36 under the same trigger with the
-fence on**, a gap that is an artifact of the control, not of the bug.
-
-Verify the arm, don't assume it: a genuinely unshielded run reports dials as
-`reached`, not `blocked`. The fence silently surviving a config change is
-exactly how a raw arm ends up measuring the wrong thing. Without
-`--standalone`, patched raw still runs with the fence loaded, so `blocked` is
-the fabrication signal there and only `reached` proves unshielded.
-
-A run that never started a session — rejected flag, dead endpoint — is now
-reported as **did not run**, never as a clean 0-dial result. Before this, 2.0.x
-scored every raw attempt as "not reproduced this round" because the CLI rejected
-`--pure`, exited 1, and the tool looked only for `UnknownError`: a broken
-invocation hid behind a verdict that read like evidence of absence. Sanity-check
-any verdict by its wall-clock — a real crawl takes minutes, not `0s`.
-
-The classifier also now ranks a URL's status (`reached` > `blocked` >
-`mention`) instead of letting the last sighting win: model prose quoting a
-URL after the call used to downgrade a real dial to a `mention`. Any `reached`
-count recorded by the older classifier is therefore a **floor**, not the
-measured value.
-
-The trigger task is a polite ~30-page crawl of `docs.python.org` (robots-
-allowed, switchable with `--site`) with a retry-once-then-gap protocol — the
-same failure-wall recipe observed to precede every real burst. It **never
-mentions the artifact URL shape**, so every classification hit is spontaneous
-model generation, never an echo of the prompt. Actual output from our build
-([wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1](https://huggingface.co/wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1)
-under vLLM + MTP(3), RTX 6000 Blackwell):
-
-```
-   [raw run 1] 701s | fabricated dials: 42 (blocked 0, reached network 42, prose mentions 0)
-   [fenced run 1] 457s | fabricated dials: 1 (blocked 1, reached network 0, prose mentions 0)
-
-=== verdict ===
-BUG CONFIRMED: the model fabricated 42 dead-relay dials (42 reached the network unshielded).
-FENCE VERIFIED: 1 attempt, all blocked, none leaked.
-```
-
-Honest expectations: quantization severity is **not** a mitigating factor.
-The template lives in the PLE n-gram table, which every quantizer ships
-byte-identically, and the official FP8 — whose own card promises behavior
-"nearly identical" to the original — fires hard. That our locally recorded
-ledger dials all came from aggressive quants only says which builds we put
-under the failure-wall load. Only BF16 remains untested, and the vendor's
-own identity claim argues *against* it being clean. A clean run on any
-build is therefore *absence of evidence, not evidence of absence*: the
-decode lottery is real in both directions — our build has produced 0 and
-52 dials on consecutive attempts. Use `--runs 2-3` and keep the classified
-URLs with `--evidence out.jsonl`. Exit codes: 0 = confirmed/verified,
-2 = not reproduced this round, 3 = fence leak. Keep `--fetches` modest if
-you change `--site` — these are public servers.
-
-> **TODO (narrowed again 2026-10-14).** **Qwen's official API has now been run and
-> fires** (46 dials over 2 runs, field report #3), so the "some third party
-> requantized it" explanation is dead: whatever precision the vendor serves, it
-> emits the template. That closes the *spirit* of the BF16 question but not its
-> letter — API precision is not externally verifiable and exposes no logprob
-> endpoint, so a locally served, precision-verified
-> BF16 [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-> run is still the only way to state the result for BF16 weights as such.
->
-> **Original TODO (2026-09-29).** Run this reproducer against the original
-> BF16 [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) —
-> served locally or via the Qwen Cloud API (addable as an
-> `@ai-sdk/openai-compatible` custom provider). Two cheap steps:
-> `--mode probe` first (three tiny requests; the prediction is the incident
-> host completing `https://rout` at mean logprob −0.00, since the n-gram
-> table that carries it has shipped byte-identically in every build ever
-> inspected, the official FP8 included), then `--mode raw --runs 3` for the
-> spontaneous rate. Field report #2 left only this build untested: a vendor
-> quant advertising "nearly identical" behavior already fires, so the
-> expectation for BF16 is **same attractor; rate under load unknown, not
-> presence**. Exposure note, refreshed 2026-09-29: **305 quantized derivatives**
-> (up from 292 four days ago) on the hub, all public downloads — and the firing
-> list now includes the official release itself. Refreshed 2026-10-14: it also
-> now includes **the vendor's own API**, which is the path most users take
-> without ever downloading a quant.
+After installation, verify a harmless call containing an indicator from a
+fragment-assembled test fixture. For example, attempt to write the joined
+indicator to a new file. The tool must report a policy block and the file must
+remain absent. Do not verify by contacting a blocked endpoint.
 
 ## Development
 
-Requires Node.js ≥ 23.6 for the test runner's TypeScript stripping.
-The hosts load TypeScript directly; no compiled distribution is needed.
+Use Node.js 23.6 or newer for the test runner's native TypeScript stripping.
+Runtime loading and TypeScript transpilation are supplied by the host.
 
 ```bash
-npm ci             # dev dependencies: TypeScript and Node types only
-npm test           # node --test
-npm run typecheck  # tsc --noEmit
-npm run repro:selftest  # offline check of tools/repro.py's classifier
-npm pack --dry-run # inspect distributable files
+npm ci
+npm run typecheck
+npm test
+npm pack --dry-run
 ```
 
-Test coverage: all four rules (exact incident host; the `routify-file-*` host
-family — oversea label, internal endpoint, `.io` variant all blocked; the
-2026-10-26 upload bucket, narrowly; the metadata/IMDS addresses with boundary
-guards), case-insensitivity, near-miss
-pass-through (legit OSS buckets, a relay operator's signed `proxy_temp_file`
-export, "Routify" the company), per-rule guidance (family-specific full/terse
-text), depth-cap boundaries, object-key scanning, empty argument shapes,
-incident call shapes (fetch, MCP `urls` array, `bash curl`, nested subagent
-prompt), unchanged arguments, per-session warning state, independent factory
-instances, and warning-history eviction. No pi or omp installation is needed
-for unit tests.
+Tests cover the rule families and near misses, including depth boundaries,
+object keys, unchanged arguments, and warning-state isolation/eviction. CI runs
+the typecheck and tests, then checks package contents. No Python tools or host
+packages are required for development.
 
-Verified with omp 18.13.2 using an extracted npm tarball without installed
-dependencies. Six blocked calls produced no filesystem side effects, three
-clean calls executed, and the loopback provider received all six policy
-reasons. The smoke run covered all four rules, nested custom-tool arguments
-and keys, and shortened guidance on a repeated block.
-
-For integration verification, launch the actual omp CLI against a loopback
-OpenAI-compatible fixture provider. Exercise blocked `bash`, `write`, and
-custom-tool calls plus clean calls; check filesystem side effects and the
-policy reasons received by the provider. Load the package directory with
-`--no-extensions -e .` to exercise manifest discovery as well as interception.
-Use isolated configuration and never dial the blocked hosts.
-
-[pi-extensions]: https://unpkg.com/@mariozechner/pi-coding-agent@0.73.1/docs/extensions.md
-[omp-extensions]: https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md
-[omp-loading]: https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md
+Runtime verification uses omp 18.13.2 with an extracted npm package and an
+isolated loopback fixture provider. Blocked tool calls must produce no filesystem
+side effects, while clean calls execute and policy reasons reach the provider.
+Pi compatibility is checked against its documented API; pi has not been installed
+or executed for runtime verification.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE) for the original attribution and terms.
+
+[upstream]: https://github.com/wtogami/qwen-block-proxy-artifacts
+[pi-extensions]: https://unpkg.com/@mariozechner/pi-coding-agent@0.73.1/docs/extensions.md
+[omp-extensions]: https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md
+[omp-loading]: https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md
